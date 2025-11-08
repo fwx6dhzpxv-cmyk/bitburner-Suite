@@ -1,3 +1,5 @@
+BUY ME A COFFEE? <3 BTC: 3Jzaw4EwSsPS1oQcZUXffNSkfcWobi6E4y
+
 # bitburner-Suite
 This master.js script for Bitburner is essentially a full-featured automation and management hub for your hacking empire, with a GUI overlay. Here’s a structured breakdown of what it does:
 
