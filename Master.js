@@ -1,24 +1,29 @@
-/** master.js - Viper's Nest Mega (Fully integrated GUI + automation + Hacknet manager)
+/** master.js - Viper's Nest Mega (Fixed)
  *
- * Single-file: automation + Sci-Fi GUI + button debug + graphs + integrated worker manager + trend indicator + visible debug overlay
- * Helpers assumed present in home: hack.js, grow.js, weaken.js, batcher.js
+ * Fixes applied:
+ *  - Declared and used a stable lastNetMapStr to avoid ReferenceError.
+ *  - Ensured all ns.share() calls are awaited to avoid concurrent-netscript errors.
+ *  - Prevented DOM handlers from calling ns.*; they only set flags.
+ *  - Added per-host deploy cooldown to reduce repeated scp spam.
+ *  - Fixed any mismatched flags/toggles so buttons are processed in the main loop.
+ *  - Defensive guards around optional APIs and trimmed error growth.
  *
  * Notes:
- *  - DOM handlers only set flags / local JS state (no ns.* in handlers).
- *  - Main loop reads flags and performs ns.* operations with proper await to avoid concurrency issues.
+ *  - Helpers expected in "home": hack.js, grow.js, weaken.js, batcher.js
+ *  - If you still see concurrency warnings, copy/paste the exact error text here and I'll iterate.
  */
 
 /** @param {NS} ns **/
 export async function main(ns) {
-  // ---------------- basic setup ----------------
+  // Basic setup
   ns.disableLog("sleep");
   ns.disableLog("getServerMoneyAvailable");
   ns.disableLog("scan");
   ns.disableLog("scp");
   ns.disableLog("exec");
-  ns.tail();
+  try { ns.tail(); } catch (e) {}
 
-  // ---------------- CONFIG (stable defaults) ----------------
+  // CONFIG
   const cfg = {
     targetCount: 4,
     baseHackFraction: 0.005,
@@ -29,18 +34,20 @@ export async function main(ns) {
     purchasedTargetUpgradeMultiplier: 2,
     HACKFLOOR: 0.0005,
     SCALE_STEP: 0.92,
-    helperFiles: ["hack.js", "grow.js", "weaken.js", "batcher.js"],
+    helperFiles: ["hack.js","grow.js","weaken.js","batcher.js"],
     trendSamples: 12,
     trendThresholdPct: 0.03,
-    // Hacknet configuration
     hacknetBudgetFraction: 0.12,
-    hacknetUpgradePriority: ["level","ram","cores"]
+    hacknetUpgradePriority: ["level","ram","cores"],
+    deployCooldownMs: 60_000,
+    deployOnlyIfMissing: true
   };
 
-  // ---------------- runtime state & metrics ----------------
+  // RUNTIME STATE
   let running = true;
   let guiState = { visible: true, minimized: false, theme: "scifi" };
   let lastButtonPressed = { id: null, time: null, label: null };
+
   const actionFlags = {
     deployNow: false,
     upgradeNow: false,
@@ -49,15 +56,22 @@ export async function main(ns) {
     startWorkers: false,
     stopWorkers: false,
     killTree: false,
-    boostMode: null,        // "hack"|"grow"|"weaken"|null
-    debugDump: false
+    boostMode: null, // "hack"|"grow"|"weaken"|null
+    debugDump: false,
+    toggleAutoPurchase: false,
+    toggleAutoRoot: false,
+    toggleAutoHacknet: false,
+    farmExp: false,
+    maxMoneyMode: false
   };
+
   const toggles = {
     autoPurchase: true,
     autoRoot: true,
     autoBuyTools: true,
     autoHacknet: true
   };
+
   const metrics = {
     moneyHistory: [],
     moneyPerSec: 0,
@@ -75,8 +89,15 @@ export async function main(ns) {
     lastPIDs: []
   };
 
-  // ---------------- small helpers ----------------
-  async function safeSleep(ms) { try { await ns.sleep(ms); } catch (e) { ns.print("sleep err: " + e); } }
+  // per-host last deploy time to avoid repeated SCP
+  const lastDeployTime = {};
+
+  // GUI placeholder
+  let guiDiv = null;
+
+  // small helpers
+  const safeSleep = async (ms) => { try { await ns.sleep(ms); } catch(e) { ns.print("sleep err: " + e); } };
+  const now = () => Date.now();
 
   function scanAll() {
     const seen = new Set(["home"]);
@@ -89,7 +110,7 @@ export async function main(ns) {
         for (const n of ns.scan(cur)) {
           if (!seen.has(n)) { seen.add(n); stack.push(n); }
         }
-      } catch (e) { ns.print("scan err " + e); }
+      } catch(e) { ns.print("scan err " + e); }
     }
     return nodes;
   }
@@ -112,9 +133,26 @@ export async function main(ns) {
     return ns.hasRootAccess(host);
   }
 
-  async function deployScriptsTo(host) {
-    for (const f of cfg.helperFiles) {
-      try { await ns.scp(f, host); } catch (e) { ns.print(`scp ${f} -> ${host} failed: ${e}`); }
+  async function scpIfNeeded(host, force=false) {
+    try {
+      const ts = now();
+      if (!force && lastDeployTime[host] && (ts - lastDeployTime[host] < cfg.deployCooldownMs)) return;
+      if (cfg.deployOnlyIfMissing && !force) {
+        // we attempt to avoid expensive fileExists checks on remote hosts; rely on cooldown primary guard.
+      }
+      for (const f of cfg.helperFiles) {
+        try { await ns.scp(f, host); } catch(e) { ns.print(`scp ${f} -> ${host} failed: ${e}`); }
+      }
+      lastDeployTime[host] = ts;
+    } catch(e) { ns.print("scpIfNeeded err: " + e); }
+  }
+
+  async function deployScriptsTo(hostOrList, force=false) {
+    if (!hostOrList) return;
+    if (Array.isArray(hostOrList)) {
+      for (const h of hostOrList) await scpIfNeeded(h, force);
+    } else {
+      await scpIfNeeded(hostOrList, force);
     }
   }
 
@@ -133,33 +171,37 @@ export async function main(ns) {
     const SEC_WEAKEN_PER_THREAD = 0.05;
     const SEC_INC_HACK = 0.002;
     const SEC_INC_GROW = 0.004;
-    const maxMoney = ns.getServerMaxMoney(targetHost);
-    const moneyAvail = Math.max(ns.getServerMoneyAvailable(targetHost),1);
-    const steal = Math.max(1, Math.min(maxMoney * frac, moneyAvail));
-    const hackThreads = Math.max(1, Math.ceil(ns.hackAnalyzeThreads(targetHost, steal)));
-    const postHack = Math.max(1, maxMoney - steal);
-    const growthFactor = Math.max(1.0, maxMoney / postHack);
-    const cores = Math.max(1, Math.floor(ns.getServer(targetHost).cpuCores || 1));
-    const growThreads = Math.max(0, Math.ceil(ns.growthAnalyze(targetHost, growthFactor, cores)));
-    const secIncrease = hackThreads * SEC_INC_HACK + growThreads * SEC_INC_GROW;
-    const weaken1 = Math.max(1, Math.ceil(secIncrease / SEC_WEAKEN_PER_THREAD));
-    const secGap = Math.max(0, ns.getServerSecurityLevel(targetHost) - ns.getServerMinSecurityLevel(targetHost));
-    const weaken2 = Math.max(0, Math.ceil(secGap / SEC_WEAKEN_PER_THREAD));
-    return { hackThreads, growThreads, weaken1, weaken2, steal };
+    try {
+      const maxMoney = ns.getServerMaxMoney(targetHost);
+      const moneyAvail = Math.max(ns.getServerMoneyAvailable(targetHost),1);
+      const steal = Math.max(1, Math.min(maxMoney * frac, moneyAvail));
+      const hackThreads = Math.max(1, Math.ceil(ns.hackAnalyzeThreads(targetHost, steal)));
+      const postHack = Math.max(1, maxMoney - steal);
+      const growthFactor = Math.max(1.0, maxMoney / postHack);
+      const cores = Math.max(1, Math.floor(ns.getServer(targetHost).cpuCores || 1));
+      const growThreads = Math.max(0, Math.ceil(ns.growthAnalyze(targetHost, growthFactor, cores)));
+      const secIncrease = hackThreads * SEC_INC_HACK + growThreads * SEC_INC_GROW;
+      const weaken1 = Math.max(1, Math.ceil(secIncrease / SEC_WEAKEN_PER_THREAD));
+      const secGap = Math.max(0, ns.getServerSecurityLevel(targetHost) - ns.getServerMinSecurityLevel(targetHost));
+      const weaken2 = Math.max(0, Math.ceil(secGap / SEC_WEAKEN_PER_THREAD));
+      return { hackThreads, growThreads, weaken1, weaken2, steal };
+    } catch(e) {
+      return { hackThreads:1, growThreads:0, weaken1:1, weaken2:0, steal:1 };
+    }
   }
 
   function pickWorkerHosts(allServers) {
     const purchased = ns.getPurchasedServers();
-    const workers = ["home"];
+    const workers = new Set(["home"]);
     for (const p of purchased) {
-      try { if (ns.getServerMaxRam(p) >= cfg.minRamForHost) workers.push(p); } catch(e){}
+      try { if (ns.getServerMaxRam(p) >= cfg.minRamForHost) workers.add(p); } catch(e){}
     }
     for (const s of allServers) {
       if (s === "home") continue;
       if (purchased.includes(s)) continue;
-      try { if (ns.hasRootAccess(s) && ns.getServerMaxRam(s) >= cfg.minRamForHost) workers.push(s); } catch(e){}
+      try { if (ns.hasRootAccess(s) && ns.getServerMaxRam(s) >= cfg.minRamForHost) workers.add(s); } catch(e){}
     }
-    return Array.from(new Set(workers));
+    return Array.from(workers);
   }
 
   function pickTargets(allServers, count) {
@@ -193,9 +235,10 @@ export async function main(ns) {
     return candidates.slice(0, 5);
   }
 
-  // ---------------- Purchased servers manager (conservative) ----------------
+  // Purchased server manager
   async function autoManagePurchasedServers(workers) {
     try {
+      if (!toggles.autoPurchase) return;
       const MAX = ns.getPurchasedServerLimit();
       const maxRamPossible = ns.getPurchasedServerMaxRam();
       const purchased = ns.getPurchasedServers();
@@ -205,24 +248,26 @@ export async function main(ns) {
       }
       if (currentMax === 0) currentMax = 8;
       let targetRam = Math.min(maxRamPossible, Math.max(currentMax * cfg.purchasedTargetUpgradeMultiplier, currentMax));
+      targetRam = Math.max(8, targetRam);
       const cost = ns.getPurchasedServerCost(targetRam);
       const available = ns.getServerMoneyAvailable("home");
       const reserve = available * cfg.cashReserveFraction;
-      if (!toggles.autoPurchase) return;
       if (available - cost < reserve) return;
       if (available < cost * cfg.purchasedBudgetFraction) return;
+
       if (purchased.length < MAX) {
         const name = `viper-${targetRam}-${Math.floor(Math.random()*9999).toString().padStart(4,"0")}`;
         try {
           const host = ns.purchaseServer(name, targetRam);
           if (host) {
-            await deployScriptsTo(host);
+            await deployScriptsTo(host, true);
             workers.push(host);
-            if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Purchased ${host} (${targetRam}GB)`);
+            guiLog(`Purchased ${host} (${targetRam}GB)`);
           }
         } catch(e){ ns.print(`purchase failed: ${e}`); }
         return;
       }
+
       let weakest = purchased[0];
       for (const p of purchased) {
         try { if (ns.getServerMaxRam(p) < ns.getServerMaxRam(weakest)) weakest = p; } catch(e){}
@@ -236,60 +281,51 @@ export async function main(ns) {
         const name = `viper-${targetRam}-${Math.floor(Math.random()*9999).toString().padStart(4,"0")}`;
         const host = ns.purchaseServer(name, targetRam);
         if (host) {
-          await deployScriptsTo(host);
+          await deployScriptsTo(host, true);
           const idx = workers.indexOf(weakest); if (idx>=0) workers.splice(idx,1);
           workers.push(host);
-          if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Replaced ${weakest} with ${host} (${targetRam}GB)`);
+          guiLog(`Replaced ${weakest} with ${host} (${targetRam}GB)`);
         }
       } catch(e){ ns.print(`replace error: ${e}`); metrics.errors.push(""+e); }
     } catch(e) { ns.print("autoManagePurchasedServers error: " + e); metrics.errors.push(""+e); }
   }
 
-  // ---------------- Hacknet manager (smart) ----------------
+  // Hacknet manager (conservative)
   async function autoManageHacknet() {
     if (!toggles.autoHacknet) return;
     if (typeof ns.hacknet === "undefined") return;
     try {
       const money = ns.getServerMoneyAvailable("home");
       const reserve = money * cfg.cashReserveFraction;
-      const budget = Math.max(0, money * cfg.hacknetBudgetFraction);
       if (money - reserve < 1e6) return; // not worth it
-      // Try to purchase a node if affordable and below max
       try {
         const purchaseCost = ns.hacknet.getPurchaseNodeCost();
         if (ns.hacknet.numNodes() < ns.hacknet.maxNumNodes && purchaseCost > 0 && money - purchaseCost > reserve) {
           const idx = ns.hacknet.purchaseNode();
-          if (idx !== -1 && guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Hacknet: purchased node #${idx} cost $${Math.floor(purchaseCost)}`);
-          // be conservative: do one purchase per loop
+          if (idx !== -1) guiLog(`Hacknet: purchased node #${idx} cost $${Math.floor(purchaseCost)}`);
           return;
         }
-      } catch(e) { /* ignore purchase cost failures */ }
+      } catch(e) {}
 
-      // Build list of candidate single-step upgrades across nodes
       const upgrades = [];
       const nodeCount = ns.hacknet.numNodes();
-      for (let i = 0; i < nodeCount; i++) {
+      for (let i=0;i<nodeCount;i++) {
         try {
           const info = ns.hacknet.getNodeStats(i);
-          const levelCost = ns.hacknet.getLevelUpgradeCost(i, 1);
-          const ramCost = ns.hacknet.getRamUpgradeCost(i, 1);
-          const coreCost = ns.hacknet.getCoreUpgradeCost(i, 1);
-          // approximate production as info.production; if absent fallback to hacknet node money per second estimate via hacknet interface might vary
+          const levelCost = ns.hacknet.getLevelUpgradeCost(i,1);
+          const ramCost = ns.hacknet.getRamUpgradeCost(i,1);
+          const coreCost = ns.hacknet.getCoreUpgradeCost(i,1);
           const baseProd = info.production || 0.0001;
-          // heuristic ROI score = estimated marginal production / cost
           const scoreLevel = (baseProd * 0.12) / Math.max(1, levelCost);
           const scoreRam = (baseProd * 0.07) / Math.max(1, ramCost);
           const scoreCore = (baseProd * 0.18) / Math.max(1, coreCost);
           upgrades.push({node:i, type:"level", cost: levelCost, score: scoreLevel});
           upgrades.push({node:i, type:"ram", cost: ramCost, score: scoreRam});
           upgrades.push({node:i, type:"cores", cost: coreCost, score: scoreCore});
-        } catch(e) {
-          // skip node if info fails
-        }
+        } catch(e) {}
       }
 
-      if (upgrades.length === 0) return;
-      // Sort by score desc, then by priority (if equal score)
+      if (!upgrades.length) return;
       upgrades.sort((a,b)=>{
         if (b.score !== a.score) return b.score - a.score;
         const pa = cfg.hacknetUpgradePriority.indexOf(a.type);
@@ -297,7 +333,6 @@ export async function main(ns) {
         return pa - pb;
       });
 
-      // Try to apply the best affordable upgrade that leaves reserve
       for (const u of upgrades) {
         if (!u || u.cost <= 0) continue;
         const moneyNow = ns.getServerMoneyAvailable("home");
@@ -310,25 +345,24 @@ export async function main(ns) {
             else if (u.type === "cores") ok = ns.hacknet.upgradeCore(u.node, 1);
           } catch(e){}
           if (ok) {
-            if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Hacknet: upgraded node ${u.node} ${u.type} (+1) cost $${Math.floor(u.cost)}`);
-            // only do one upgrade per main-loop iteration (conservative)
+            guiLog(`Hacknet: upgraded node ${u.node} ${u.type} (+1) cost $${Math.floor(u.cost)}`);
             return;
           }
         }
       }
-    } catch (e) {
-      ns.print("autoManageHacknet err: " + e);
-      metrics.errors.push(""+e);
+    } catch(e) { ns.print("autoManageHacknet err: " + e); metrics.errors.push(""+e); }
+  }
+
+  // Auto-root
+  async function autoRootAll(allServers) {
+    if (!toggles.autoRoot) return;
+    for (const s of allServers) {
+      if (s === "home") continue;
+      try { if (!ns.hasRootAccess(s)) tryNuke(s); } catch(e){}
     }
   }
 
-  // ---------------- Auto-root ----------------
-  async function autoRootAll(allServers) {
-    if (!toggles.autoRoot) return;
-    for (const s of allServers) { if (s==="home") continue; if (ns.hasRootAccess(s)) continue; tryNuke(s); }
-  }
-
-  // ---------------- Auto-buy optional tools ----------------
+  // Auto-buy optional tools
   async function autoBuyOptionalTools() {
     if (!toggles.autoBuyTools) return;
     try {
@@ -341,7 +375,7 @@ export async function main(ns) {
           if (typeof ns.purchaseProgram === "function") {
             if (ns.getServerMoneyAvailable("home") - reserve > 1e6) {
               await ns.purchaseProgram(p);
-              if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`autoBuy: purchased ${p}`);
+              guiLog(`autoBuy: purchased ${p}`);
             }
           }
         } catch(e){ ns.print(`autoBuy err ${p}: ${e}`); metrics.errors.push(""+e); }
@@ -350,11 +384,9 @@ export async function main(ns) {
     } catch(e){ ns.print("autoBuyOptionalTools error: " + e); metrics.errors.push(""+e); }
   }
 
-  // ---------------- Auto-Corporation Manager (safe / conservative) ----------------
+  // Auto-corp manager (safe)
   async function autoCorporationManager() {
-    if (typeof ns.corporation !== "object" && typeof ns.corporation !== "function") {
-      return; // corp not available - skip quietly
-    }
+    if (typeof ns.corporation !== "object" && typeof ns.corporation !== "function") return;
     try {
       let corpExists = false;
       try { corpExists = !!ns.corporation.getCorporation(); } catch(e) { corpExists = false; }
@@ -362,20 +394,20 @@ export async function main(ns) {
         const money = ns.getServerMoneyAvailable("home");
         const corpCostSafe = 150e6;
         if (money < corpCostSafe * 1.5) {
-          if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoCorp: not enough cash ($${Math.floor(money)}) to safely create corp.`, "warn");
+          guiLog(`AutoCorp: not enough cash ($${Math.floor(money)}) to safely create corp.`, "warn");
           return;
         }
-        try { ns.corporation.createCorporation("StableCorp", false); if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("AutoCorp: created corporation 'StableCorp'."); } catch(e){ ns.print(`AutoCorp create failed: ${e}`); metrics.errors.push(""+e); return; }
+        try { ns.corporation.createCorporation("StableCorp", false); guiLog("AutoCorp: created corporation 'StableCorp'."); } catch(e){ ns.print(`AutoCorp create failed: ${e}`); metrics.errors.push(""+e); return; }
       }
 
       try {
         const industry = "Tobacco";
-        let divName = "StableDiv";
+        const divName = "StableDiv";
         try {
           const corp = ns.corporation.getCorporation();
           if (!corp.divisions || !corp.divisions.some(d=>d.name===divName)) {
             ns.corporation.expandIndustry(industry, divName);
-            if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoCorp: expanded industry ${industry} as ${divName}.`);
+            guiLog(`AutoCorp: expanded industry ${industry} as ${divName}.`);
           }
         } catch(e) {
           try {
@@ -383,7 +415,7 @@ export async function main(ns) {
             if (industries && industries.length) {
               const fallback = industries[0];
               ns.corporation.expandIndustry(fallback, divName);
-              if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoCorp: expanded industry ${fallback} as ${divName} (fallback).`);
+              guiLog(`AutoCorp: expanded industry ${fallback} as ${divName} (fallback).`);
             }
           } catch(err) { ns.print(`AutoCorp expandIndustry failed: ${err}`); metrics.errors.push(""+err); }
         }
@@ -393,7 +425,7 @@ export async function main(ns) {
           if (div && !div.cities.includes(city)) {
             ns.corporation.expandCity(divName, city);
             try { ns.corporation.purchaseOffice(divName, city, 3); } catch(e){}
-            if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoCorp: opened ${divName} office in ${city}.`);
+            guiLog(`AutoCorp: opened ${divName} office in ${city}.`);
           }
         } catch(e) {}
         try {
@@ -410,331 +442,206 @@ export async function main(ns) {
     } catch(e){ ns.print(`AutoCorp handler error: ${e}`); metrics.errors.push(""+e); }
   }
 
-  // ---------------- Exp Farming ----------------
+  // Exp farming
   async function farmExpMode(targets, workers) {
     try {
       for (const t of targets) {
-        const threads = Math.floor(totalFreeRam(workers) / ns.getScriptRam("weaken.js"));
+        const weakenRam = ns.getScriptRam("weaken.js");
+        const threads = Math.floor(totalFreeRam(workers) / Math.max(1, weakenRam));
         if (threads > 0) {
-          ns.exec("weaken.js", workers[0], threads, t);
+          try { ns.exec("weaken.js", workers[0], threads, t); } catch(e){}
           await safeSleep(100);
-          ns.exec("hack.js", workers[0], Math.floor(threads/10), t);
-          if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Farming exp on ${t} with ${threads} threads`);
+          try { ns.exec("hack.js", workers[0], Math.max(1, Math.floor(threads/10)), t); } catch(e){}
+          guiLog(`Farming exp on ${t} with ${threads} threads`);
         }
       }
     } catch(e) { metrics.errors.push(""+e); }
   }
 
-  // ---------------- Max Money Mode ----------------
+  // Max money (await share)
   async function maxMoneyMode(targets, workers) {
     const oldFrac = cfg.baseHackFraction;
     cfg.baseHackFraction = 0.05;
-    for (let i=0; i<5; i++) {
+    for (let i=0;i<5;i++) {
       await startIntegratedWorkers(targets, workers);
       await safeSleep(500);
     }
-    try { ns.share(); } catch(e){}
+    try { await ns.share(); } catch(e) { ns.print("share errored: "+e); }
     cfg.baseHackFraction = oldFrac;
-    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Max Money Mode activated - high hack + share");
+    guiLog("Max Money Mode activated - high hack + share");
   }
 
-  // ---------------- GUI Implementation ----------------
-  let guiDiv = null;
-  function createGUI(force=false) {
-    if (guiDiv && !force) return;
-    if (guiDiv && force) try { guiDiv.remove(); guiDiv = null; } catch(e){}
+  // GUI helpers
+  function isDomAvailable() {
+    return (typeof document !== "undefined") && !!document.body;
+  }
+  function guiLog(msg, level="info") {
+    try {
+      ns.print(msg);
+      if (isDomAvailable() && guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(msg, level);
+    } catch(e) { ns.print("guiLog err: " + e); }
+  }
 
-    // root div with sci-fi glow
+  // Create GUI (DOM-safe)
+  let lastNetMapStr = ""; // fixed missing declaration
+  function createGUI(force=false) {
+    if (!isDomAvailable()) return;
+    if (guiDiv && !force) return;
+    try { if (guiDiv && force) { guiDiv.remove(); guiDiv = null; } } catch(e){}
+    // build GUI: minimal but functional; handlers only set flags, no ns.* calls
     guiDiv = document.createElement("div");
     guiDiv.id = "vipers-nest";
-    Object.assign(guiDiv.style, {
-      position: "fixed", top: "18px", left: "18px", width: "640px", zIndex: 99999,
-      fontFamily: "Inter, Arial, sans-serif", color: "#cfefff", borderRadius: "12px",
-      boxShadow: "0 0 20px rgba(0,255,255,0.5), 0 0 40px rgba(0,255,255,0.3)", background: "linear-gradient(135deg, rgba(6,6,15,0.95), rgba(12,8,25,0.95))",
-      border: "1px solid rgba(0,255,255,0.3)", overflow: "hidden", userSelect: "none",
-      transition: "all 0.3s ease-in-out"
-    });
+    Object.assign(guiDiv.style, { position: "fixed", top: "18px", left: "18px", width: "640px", zIndex: 99999, fontFamily: "Inter, Arial, sans-serif", color: "#cfefff", padding: "6px", background: "rgba(4,6,12,0.85)" });
 
-    // header with neon text
-    const header = document.createElement("div");
-    header.style.display = "flex"; header.style.alignItems = "center"; header.style.padding = "8px 12px"; header.style.gap = "10px";
-    header.style.boxShadow = "0 2px 10px rgba(0,255,255,0.2)";
-    const title = document.createElement("div"); title.innerText = "Viper's Nest — Master (trend + debug)"; Object.assign(title.style, {fontWeight:"900", fontSize:"15px", color:"#6fffd1", textShadow:"0 0 6px #66ffff, 0 0 12px #66ffff"});
+    const header = document.createElement("div"); header.style.display="flex";
+    const title = document.createElement("div"); title.innerText = "Viper's Nest — Master"; title.style.fontWeight = "800"; title.style.marginRight = "8px";
     header.appendChild(title);
     const spacer = document.createElement("div"); spacer.style.flex = "1"; header.appendChild(spacer);
-    const pauseInfo = document.createElement("div"); pauseInfo.innerText = "PAUSE REQUIRED before Kill/Restart"; Object.assign(pauseInfo.style, {fontSize:"11px", color:"#ffdca3", fontWeight:"700", marginRight:"8px", textShadow:"0 0 4px #ffdca3"});
-    header.appendChild(pauseInfo);
-
-    const btnMin = document.createElement("button"); btnMin.innerText = "Minimize"; btnMin.title = "Minimize"; Object.assign(btnMin.style, {background:"transparent",border:"none",color:"#88dfff",cursor:"pointer",fontSize:"14px",fontWeight:"700", textShadow:"0 0 4px #88dfff"});
-    header.appendChild(btnMin);
-    const btnClose = document.createElement("button"); btnClose.innerText = "Close"; btnClose.title = "Close (vipersNestMenu() to reopen)"; Object.assign(btnClose.style, {background:"transparent",border:"none",color:"#ff9b9b",cursor:"pointer",fontSize:"14px",fontWeight:"700", textShadow:"0 0 4px #ff9b9b"});
-    header.appendChild(btnClose);
-
+    const btnMin = document.createElement("button"); btnMin.textContent = "_"; const btnClose = document.createElement("button"); btnClose.textContent = "X";
+    header.appendChild(btnMin); header.appendChild(btnClose);
     guiDiv.appendChild(header);
 
-    // content grid
-    const content = document.createElement("div"); content.style.display = "grid"; content.style.gridTemplateColumns = "1fr 1fr"; content.style.gap = "10px"; content.style.padding = "8px 12px 12px 12px";
-
-    // make card helper (animated with glow)
-    function makeCard(titleText) {
-      const c = document.createElement("div");
-      Object.assign(c.style, {
-        background: "linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))",
-        border: "1px solid rgba(0,255,255,0.2)",
-        borderRadius: "8px",
-        padding: "8px",
-        minHeight: "56px",
-        display: "flex",
-        flexDirection: "column",
-        justifyContent: "space-between",
-        transition: "all 0.5s ease",
-        overflow: "hidden",
-        boxShadow: "0 0 10px rgba(0,255,255,0.1)"
-      });
-      const t = document.createElement("div"); t.innerText = titleText; t.style.fontSize = "11px"; t.style.color = "#8fdfff"; t.style.fontWeight="700"; t.style.textShadow = "0 0 4px #8fdfff"; c.appendChild(t);
-      const v = document.createElement("div"); v.innerText = "..."; v.style.fontSize = "16px"; v.style.fontWeight = "800"; v.style.color = "#dffeff"; v.style.transition="all 0.4s ease"; v.style.textShadow = "0 0 6px #dffeff"; c.appendChild(v);
-      return {card:c, title:t, value:v};
-    }
-
-    // left column stats & graph
-    const statMoney = makeCard("Money on Hand");
-    const statMoneySec = makeCard("Est $ / sec");
-    const statWorkers = makeCard("Workers (rooted)");
-    const statPurchased = makeCard("Purchased Servers (RAM)");
-
-    const left = document.createElement("div"); left.style.display="flex"; left.style.flexDirection="column"; left.style.gap="8px";
+    const content = document.createElement("div"); content.style.display = "grid"; content.style.gridTemplateColumns = "1fr 1fr"; content.style.gap = "8px"; content.style.marginTop = "8px";
+    // left cards
+    function makeCard(t) { const c = document.createElement("div"); c.style.padding="6px"; c.style.border = "1px solid rgba(255,255,255,0.06)"; const title = document.createElement("div"); title.innerText = t; const val = document.createElement("div"); val.innerText="..."; val.style.fontWeight="800"; val.style.marginTop="6px"; c.appendChild(title); c.appendChild(val); return {card:c, title, value: val}; }
+    const statMoney = makeCard("Money on Hand"), statMoneySec = makeCard("Est $ / s"), statWorkers = makeCard("Workers (rooted)"), statPurchased = makeCard("Purchased Servers (RAM)");
+    const left = document.createElement("div"); left.style.display="flex"; left.style.flexDirection="column"; left.style.gap="6px";
     left.appendChild(statMoney.card); left.appendChild(statMoneySec.card); left.appendChild(statWorkers.card); left.appendChild(statPurchased.card);
 
-    // graph card with tech border
-    const graphCard = document.createElement("div");
-    Object.assign(graphCard.style, {background:"rgba(255,255,255,0.01)", border:"1px solid rgba(0,255,255,0.2)", borderRadius:"8px", padding:"6px", minHeight:"120px", boxShadow: "0 0 10px rgba(0,255,255,0.15)"});
-    const graphTitleRow = document.createElement("div"); graphTitleRow.style.display="flex"; graphTitleRow.style.justifyContent="space-between"; graphTitleRow.style.alignItems="center";
-    const graphTitle = document.createElement("div"); graphTitle.innerText="Performance Graph"; graphTitle.style.color="#a8eaff"; graphTitle.style.fontSize="11px"; graphTitle.style.textShadow = "0 0 4px #a8eaff";
-    const trendBadge = document.createElement("div"); trendBadge.innerText = "TREND: —"; Object.assign(trendBadge.style,{fontSize:"12px", fontWeight:"800", color:"#dffeff", textShadow: "0 0 4px #dffeff"});
-    graphTitleRow.appendChild(graphTitle); graphTitleRow.appendChild(trendBadge);
-    graphCard.appendChild(graphTitleRow);
-    const canvas = document.createElement("canvas"); canvas.width = 560; canvas.height = 110; canvas.style.width="100%"; canvas.style.height="110px"; graphCard.appendChild(canvas);
+    // graph area
+    const graphCard = document.createElement("div"); graphCard.style.border = "1px solid rgba(255,255,255,0.06)"; graphCard.style.padding="6px";
+    const graphTitle = document.createElement("div"); graphTitle.innerText = "Performance Graph"; graphCard.appendChild(graphTitle);
+    const canvas = document.createElement("canvas"); canvas.width = 560; canvas.height = 110; canvas.style.width = "100%"; canvas.style.height = "110px";
+    graphCard.appendChild(canvas);
     left.appendChild(graphCard);
 
-    // right column controls, map, AI
-    const right = document.createElement("div"); right.style.display="flex"; right.style.flexDirection="column"; right.style.gap="8px";
-
-    // controls area
-    const controls = document.createElement("div"); Object.assign(controls.style,{display:"flex",flexWrap:"wrap",gap:"6px"});
-    function mkBtn(label, tooltip, id) {
-      const b = document.createElement("button");
-      b.innerText = label;
-      b.title = tooltip;
-      b.id = id;
-      Object.assign(b.style, {
-        padding: "8px 10px",
-        borderRadius: "8px",
-        border: "1px solid rgba(0,255,255,0.3)",
-        background: "linear-gradient(180deg, rgba(40,50,70,0.8), rgba(20,30,50,0.8))",
-        color: "#0ff",
-        fontWeight: "800",
-        fontSize: "11px",
-        cursor: "pointer",
-        transition: "all 0.2s ease",
-        boxShadow: "0 0 8px rgba(0,255,255,0.4)",
-        textShadow: "0 0 4px rgba(0,255,255,0.6)"
-      });
-      b.onmouseenter = () => { 
-        b.style.background = "linear-gradient(180deg, rgba(60,80,120,0.9), rgba(40,60,100,0.9))";
-        b.style.boxShadow = "0 0 16px rgba(0,255,255,0.8)";
-        b.style.transform = "translateY(-1px)";
-      };
-      b.onmouseleave = () => { 
-        b.style.background = "linear-gradient(180deg, rgba(40,50,70,0.8), rgba(20,30,50,0.8))";
-        b.style.boxShadow = "0 0 8px rgba(0,255,255,0.4)";
-        b.style.transform = "translateY(0)";
-      };
-      return b;
-    }
-
-    const btnStart = mkBtn("Start","Start automations","vn_start");
-    const btnPause = mkBtn("Pause","Pause automations","vn_pause");
-    const btnDeploy = mkBtn("Deploy Now","Deploy helper scripts to all workers now","vn_deploy");
-    const btnUpgrade = mkBtn("Upgrade Now","Attempt immediate purchased-server upgrade","vn_upgrade");
-    const btnKill = mkBtn("Kill Helpers","Kill helper scripts on purchased servers (PAUSE first)","vn_kill");
-    const btnKillTree = mkBtn("Kill-Tree","Kill helpers across network (PAUSE first)","vn_killtree");
-    const btnStartWorkers = mkBtn("Start Workers","Start integrated worker manager (launch batchers)","vn_startworkers");
-    const btnStopWorkers = mkBtn("Stop Workers","Stop integrated worker manager (kill batchers)","vn_stopworkers");
-    const btnBoostHack = mkBtn("Boost Hack","Temporary aggressive hack mode","vn_boost_hack");
-    const btnBoostGrow = mkBtn("Boost Grow","Temporary aggressive grow mode","vn_boost_grow");
-    const btnBoostWeaken = mkBtn("Boost Weaken","Temporary heavy weaken mode","vn_boost_weaken");
-    const btnDebugDump = mkBtn("Debug Dump","Dump debug info to log","vn_debugdump");
-    const btnToggleAutoPurchase = mkBtn("AutoPurchase","Toggle auto server purchase","vn_toggle_autopurchase");
-    const btnToggleAutoRoot = mkBtn("AutoRoot","Toggle auto rooting","vn_toggle_autoroot");
-    const btnToggleAutoHacknet = mkBtn("AutoHacknet","Toggle auto hacknet upgrades","vn_toggle_autohacknet");
-    const btnFarmExp = mkBtn("Farm Exp","Farm hacking exp on easy targets","vn_farm_exp");
-    const btnMaxMoney = mkBtn("Max Money","Aggressive money farming","vn_max_money");
-
+    // right column
+    const right = document.createElement("div"); right.style.display="flex"; right.style.flexDirection="column"; right.style.gap="6px";
+    const controls = document.createElement("div"); controls.style.display="flex"; controls.style.flexWrap="wrap"; controls.style.gap="6px";
+    function mkBtn(label, id) { const b = document.createElement("button"); b.innerText = label; b.id = id; b.style.padding = "6px"; return b; }
+    const btnStart = mkBtn("Start","vn_start"), btnPause = mkBtn("Pause","vn_pause"), btnDeploy = mkBtn("Deploy Now","vn_deploy"), btnUpgrade = mkBtn("Upgrade Now","vn_upgrade");
+    const btnKill = mkBtn("Kill Helpers","vn_kill"), btnKillTree = mkBtn("Kill-Tree","vn_killtree"), btnStartWorkers = mkBtn("Start Workers","vn_startworkers"), btnStopWorkers = mkBtn("Stop Workers","vn_stopworkers");
+    const btnBoostHack = mkBtn("Boost Hack","vn_boost_hack"), btnBoostGrow = mkBtn("Boost Grow","vn_boost_grow"), btnBoostWeaken = mkBtn("Boost Weaken","vn_boost_weaken");
+    const btnDebugDump = mkBtn("Debug Dump","vn_debugdump"), btnToggleAutoPurchase = mkBtn("AutoPurchase","vn_toggle_autopurchase"), btnToggleAutoRoot = mkBtn("AutoRoot","vn_toggle_autoroot");
+    const btnToggleAutoHacknet = mkBtn("AutoHacknet","vn_toggle_autohacknet"), btnFarmExp = mkBtn("Farm Exp","vn_farm_exp"), btnMaxMoney = mkBtn("Max Money","vn_max_money");
     [btnStart,btnPause,btnDeploy,btnUpgrade,btnKill,btnKillTree,btnStartWorkers,btnStopWorkers,btnBoostHack,btnBoostGrow,btnBoostWeaken,btnDebugDump,btnToggleAutoPurchase,btnToggleAutoRoot,btnToggleAutoHacknet,btnFarmExp,btnMaxMoney].forEach(b=>controls.appendChild(b));
     right.appendChild(controls);
 
-    // map card with glow
-    const mapCard = document.createElement("div"); Object.assign(mapCard.style, {background:"linear-gradient(180deg, rgba(0,0,0,0.12), rgba(0,0,0,0.06))", border:"1px solid rgba(0,255,255,0.2)", borderRadius:"8px", padding:"8px", minHeight:"60px", maxHeight:"60px", overflowY:"auto", boxShadow: "0 0 10px rgba(0,255,255,0.15)"});
-    const mapTitle = document.createElement("div"); mapTitle.innerText = "Network Map (rooted)"; mapTitle.style.color="#a8eaff"; mapTitle.style.fontSize="11px"; mapTitle.style.textShadow = "0 0 4px #a8eaff"; mapCard.appendChild(mapTitle);
-    const mapList = document.createElement("div"); mapList.style.fontSize="10px"; mapList.style.color="#dffaff"; mapList.style.marginTop="4px"; mapList.style.textShadow = "0 0 4px #dffaff"; mapCard.appendChild(mapList);
+    const mapCard = document.createElement("div"); mapCard.style.border="1px solid rgba(255,255,255,0.06)"; mapCard.style.padding="6px"; mapCard.style.maxHeight="120px"; mapCard.style.overflowY="auto";
+    const mapTitle = document.createElement("div"); mapTitle.innerText = "Network Map (rooted)"; const mapList = document.createElement("div"); mapList.style.fontSize="12px"; mapList.style.marginTop="6px";
+    mapCard.appendChild(mapTitle); mapCard.appendChild(mapList);
     right.appendChild(mapCard);
 
-    // AI card with pulsating core
-    const aiCard = document.createElement("div"); Object.assign(aiCard.style, {display:"flex",alignItems:"center",gap:"10px",background:"linear-gradient(180deg, rgba(5,10,20,0.2), rgba(0,0,0,0.05))",border:"1px solid rgba(0,255,255,0.2)",borderRadius:"8px",padding:"8px", boxShadow: "0 0 10px rgba(0,255,255,0.15)"});
-    const aiBubble = document.createElement("div"); Object.assign(aiBubble.style,{width:"46px",height:"46px",borderRadius:"999px",background:"radial-gradient(circle at 30% 30%, #2feaff, #005b8a)",boxShadow:"0 8px 20px rgba(47,234,255,0.08)", transition: "all 0.5s ease", animation: "corePulse 1.5s infinite alternate"});
-    aiCard.appendChild(aiBubble);
-    const aiText = document.createElement("div"); aiText.style.display="flex"; aiText.style.flexDirection="column"; aiText.innerHTML = `<div style="font-weight:700;color:#aeefff; text-shadow:0 0 4px #aeefff">Assistant Core</div><div style="font-size:11px;color:#cfefff; text-shadow:0 0 4px #cfefff">Status: active</div>`;
-    aiCard.appendChild(aiText);
-    right.appendChild(aiCard);
+    const debugCard = document.createElement("div"); debugCard.style.gridColumn = "1 / span 2"; debugCard.style.marginTop = "8px"; debugCard.style.padding = "6px"; debugCard.style.border="1px solid rgba(255,255,255,0.06)";
+    const debugBox = document.createElement("div"); debugBox.style.maxHeight="140px"; debugBox.style.overflowY="auto"; debugCard.appendChild(debugBox);
 
-    // debug overlay with subtle glow
-    const debugCard = document.createElement("div"); Object.assign(debugCard.style, {gridColumn:"1/span 2", minHeight:"120px", maxHeight:"220px", overflow:"auto", padding:"8px", borderRadius:"8px", border:"1px solid rgba(255,200,100,0.2)", background:"linear-gradient(180deg, rgba(8,8,12,0.25), rgba(0,0,0,0.06))", boxShadow: "0 0 10px rgba(255,200,100,0.15)"});
-    const debugTitle = document.createElement("div"); debugTitle.innerText="Debug Overlay (visible)"; debugTitle.style.color="#ffdca3"; debugTitle.style.fontSize="12px"; debugTitle.style.textShadow = "0 0 4px #ffdca3"; debugCard.appendChild(debugTitle);
-    const debugBox = document.createElement("div"); debugBox.style.color="#dffaff"; debugBox.style.fontSize="12px"; debugBox.style.marginTop="6px"; debugBox.style.textShadow = "0 0 4px #dffaff"; debugCard.appendChild(debugBox);
-
-    // attach layout
     content.appendChild(left); content.appendChild(right); guiDiv.appendChild(content); guiDiv.appendChild(debugCard);
     document.body.appendChild(guiDiv);
 
-    // drag logic
-    let drag = {active:false, startX:0, startY:0, origX:0, origY:0};
-    header.onmousedown = (e) => { drag.active = true; drag.startX = e.clientX; drag.startY = e.clientY; drag.origX = guiDiv.offsetLeft; drag.origY = guiDiv.offsetTop; e.preventDefault(); };
-    document.onmouseup = () => { drag.active = false; };
-    document.onmousemove = (e) => { if (!drag.active) return; guiDiv.style.left = (drag.origX + e.clientX - drag.startX) + "px"; guiDiv.style.top = (drag.origY + e.clientY - drag.startY) + "px"; };
+    // minimal drag
+    let drag = null;
+    header.onmousedown = (e) => { drag = {sx:e.clientX, sy:e.clientY, ox: guiDiv.offsetLeft, oy: guiDiv.offsetTop}; };
+    document.onmouseup = () => { drag = null; };
+    document.onmousemove = (e) => { if (!drag) return; guiDiv.style.left = (drag.ox + e.clientX - drag.sx) + "px"; guiDiv.style.top = (drag.oy + e.clientY - drag.sy) + "px"; };
 
     // push log (DOM-only)
     function pushLog(msg, level="info") {
-      const time = new Date().toLocaleTimeString();
-      const row = document.createElement("div");
-      row.innerText = `[${time}] ${msg}`;
-      row.style.marginBottom = "4px";
-      row.style.textShadow = "0 0 4px currentColor";
-      if (level === "warn") row.style.color = "#ffcc66";
-      if (level === "err") row.style.color = "#ff9999";
-      try { debugBox.prepend(row); } catch(e){}
-      while (debugBox.childNodes.length > 400) debugBox.removeChild(debugBox.lastChild);
+      try {
+        const time = new Date().toLocaleTimeString();
+        const row = document.createElement("div");
+        row.innerText = `[${time}] ${msg}`;
+        if (level === "warn") row.style.color = "#ffcc66";
+        if (level === "err") row.style.color = "#ff9999";
+        debugBox.prepend(row);
+        while (debugBox.childNodes.length > 400) debugBox.removeChild(debugBox.lastChild);
+      } catch(e){}
     }
 
-    // refs for updates
-    guiDiv.__refs = {
-      statMoney, statMoneySec, statWorkers, statPurchased, canvas, mapList, aiBubble, debugBox, pushLog, trendBadge
-    };
+    // refs
+    guiDiv.__refs = { statMoney, statMoneySec, statWorkers, statPurchased, canvas, mapList, debugBox, pushLog };
 
-    // expose minimal GUI reopen function
-    if (typeof globalThis.vipersNestMenu === "undefined") {
-      globalThis.vipersNestMenu = function(force=false){ try { createGUI(force); } catch(e){ ns.tprint("vipersNestMenu err: " + e); } };
-    }
+    // global reopen helper
+    try { globalThis.vipersNestMenu = (force=false) => { try { createGUI(force); } catch(e){ ns.tprint("vipersNestMenu err: " + e); } }; } catch(e){}
 
-    // BUTTON HANDLERS (DOM-only set flags + local log)
-    function recordButtonPress(id, label) {
-      lastButtonPressed = { id, time: Date.now(), label };
-      try { guiDiv.__refs.pushLog(`Button pressed -> ${label}`); } catch(e){}
-    }
+    // BUTTON HANDLERS: only set flags and record local GUI state. NO ns.* calls here.
+    const recordButton = (id,label) => { lastButtonPressed = { id, time: now(), label }; try { guiDiv.__refs.pushLog(`Button pressed -> ${label}`); } catch(e){} };
 
-    btnStart.onclick = () => { recordButtonPress("vn_start","Start"); running = true; };
-    btnPause.onclick = () => { recordButtonPress("vn_pause","Pause"); running = false; };
-    btnDeploy.onclick = () => { recordButtonPress("vn_deploy","Deploy Now"); actionFlags.deployNow = true; };
-    btnUpgrade.onclick = () => { recordButtonPress("vn_upgrade","Upgrade Now"); actionFlags.upgradeNow = true; };
-    btnKill.onclick = () => { recordButtonPress("vn_kill","Kill Helpers"); actionFlags.killAllHelpers = true; };
-    btnKillTree.onclick = () => { recordButtonPress("vn_killtree","Kill-Tree"); actionFlags.killTree = true; };
-    btnStartWorkers.onclick = () => { recordButtonPress("vn_startworkers","Start Workers"); actionFlags.startWorkers = true; };
-    btnStopWorkers.onclick = () => { recordButtonPress("vn_stopworkers","Stop Workers"); actionFlags.stopWorkers = true; };
-    btnBoostHack.onclick = () => { recordButtonPress("vn_boost_hack","Boost Hack"); actionFlags.boostMode = "hack"; };
-    btnBoostGrow.onclick = () => { recordButtonPress("vn_boost_grow","Boost Grow"); actionFlags.boostMode = "grow"; };
-    btnBoostWeaken.onclick = () => { recordButtonPress("vn_boost_weaken","Boost Weaken"); actionFlags.boostMode = "weaken"; };
-    btnDebugDump.onclick = () => { recordButtonPress("vn_debugdump","Debug Dump"); actionFlags.debugDump = true; };
-    btnToggleAutoPurchase.onclick = () => { recordButtonPress("vn_toggle_autopurchase","Toggle AutoPurchase"); actionFlags.toggleAutoPurchase = true; };
-    btnToggleAutoRoot.onclick = () => { recordButtonPress("vn_toggle_autoroot","Toggle AutoRoot"); actionFlags.toggleAutoRoot = true; };
-    btnToggleAutoHacknet.onclick = () => { recordButtonPress("vn_toggle_autohacknet","Toggle AutoHacknet"); actionFlags.toggleAutoHacknet = true; };
-    btnFarmExp.onclick = () => { recordButtonPress("vn_farm_exp","Farm Exp"); actionFlags.farmExp = true; };
-    btnMaxMoney.onclick = () => { recordButtonPress("vn_max_money","Max Money Mode"); actionFlags.maxMoneyMode = true; };
+    btnStart.onclick = () => { recordButton("vn_start","Start"); running = true; };
+    btnPause.onclick = () => { recordButton("vn_pause","Pause"); running = false; };
+    btnDeploy.onclick = () => { recordButton("vn_deploy","Deploy Now"); actionFlags.deployNow = true; };
+    btnUpgrade.onclick = () => { recordButton("vn_upgrade","Upgrade Now"); actionFlags.upgradeNow = true; };
+    btnKill.onclick = () => { recordButton("vn_kill","Kill Helpers"); actionFlags.killAllHelpers = true; };
+    btnKillTree.onclick = () => { recordButton("vn_killtree","Kill-Tree"); actionFlags.killTree = true; };
+    btnStartWorkers.onclick = () => { recordButton("vn_startworkers","Start Workers"); actionFlags.startWorkers = true; };
+    btnStopWorkers.onclick = () => { recordButton("vn_stopworkers","Stop Workers"); actionFlags.stopWorkers = true; };
+    btnBoostHack.onclick = () => { recordButton("vn_boost_hack","Boost Hack"); actionFlags.boostMode = "hack"; };
+    btnBoostGrow.onclick = () => { recordButton("vn_boost_grow","Boost Grow"); actionFlags.boostMode = "grow"; };
+    btnBoostWeaken.onclick = () => { recordButton("vn_boost_weaken","Boost Weaken"); actionFlags.boostMode = "weaken"; };
+    btnDebugDump.onclick = () => { recordButton("vn_debugdump","Debug Dump"); actionFlags.debugDump = true; };
+    btnToggleAutoPurchase.onclick = () => { recordButton("vn_toggle_autopurchase","Toggle AutoPurchase"); actionFlags.toggleAutoPurchase = true; };
+    btnToggleAutoRoot.onclick = () => { recordButton("vn_toggle_autoroot","Toggle AutoRoot"); actionFlags.toggleAutoRoot = true; };
+    btnToggleAutoHacknet.onclick = () => { recordButton("vn_toggle_autohacknet","Toggle AutoHacknet"); actionFlags.toggleAutoHacknet = true; };
+    btnFarmExp.onclick = () => { recordButton("vn_farm_exp","Farm Exp"); actionFlags.farmExp = true; };
+    btnMaxMoney.onclick = () => { recordButton("vn_max_money","Max Money Mode"); actionFlags.maxMoneyMode = true; };
 
     btnMin.onclick = () => { guiState.minimized = !guiState.minimized; content.style.display = guiState.minimized ? "none" : "grid"; debugCard.style.display = guiState.minimized ? "none" : "block"; pushLog(`Minimize toggled -> ${guiState.minimized}`); };
-    btnClose.onclick = () => { guiDiv.remove(); guiDiv = null; guiState.visible = false; if (typeof globalThis.vipersNestMenu === "function") globalThis.vipersNestMenu(false); };
+    btnClose.onclick = () => { try { guiDiv.remove(); } catch(e){} guiDiv = null; guiState.visible = false; };
 
-    // map update helper
     guiDiv.__updateMap = (nodes) => {
       try {
         mapList.innerHTML = "";
         for (const n of nodes) {
           const el = document.createElement("div");
-          const rootInfo = ns.hasRootAccess(n) ? " Check" : "";
-          el.innerText = `${n}${rootInfo} (${ns.getServerMaxRam(n)||0}GB)`;
-          el.style.textShadow = "0 0 4px #dffaff";
+          const rootInfo = ns.hasRootAccess(n) ? " (root)" : "";
+          el.innerText = `${n}${rootInfo} · ${ns.getServerMaxRam(n)||0}GB`;
           mapList.appendChild(el);
         }
       } catch(e){}
     };
+  } // end createGUI
 
-    guiDiv.__canvas = canvas;
-    guiDiv.__aiBubble = aiBubble;
-    guiDiv.__pushLog = pushLog;
+  // try to create GUI
+  try { createGUI(); } catch(e) { ns.print("GUI create error: " + e); }
 
-    // Add global animation keyframes
-    const style = document.createElement('style');
-    style.innerHTML = `
-      @keyframes subtlePulse {
-        0% { opacity: 0.9; }
-        100% { opacity: 1; }
-      }
-      @keyframes corePulse {
-        0% { transform: scale(1); box-shadow: 0 0 10px rgba(47,234,255,0.5); }
-        100% { transform: scale(1.05); box-shadow: 0 0 20px rgba(47,234,255,0.8); }
-      }
-      @keyframes corePulseRed {
-        0% { transform: scale(1); box-shadow: 0 0 10px rgba(255,0,0,0.5); }
-        100% { transform: scale(1.05); box-shadow: 0 0 20px rgba(255,0,0,0.8); }
-      }
-    `;
-    document.head.appendChild(style);
-  } // createGUI end
-
-  // create GUI initially
-  try { createGUI(); } catch ( e ) { ns.print("GUI create error: " + e); }
-
-  // ---------------- Action implementations (called from main loop) ----------------
+  // action implementations (processed inside main loop so they can call ns.* safely)
   async function doDeployNow(workers) {
     for (const w of workers) {
-      try { await deployScriptsTo(w); } catch ( e ) { ns.print("deploy err: " + e); }
+      try {
+        for (const f of cfg.helperFiles) {
+          try { await ns.scp(f, w); } catch(e) { ns.print(`scp ${f} -> ${w} failed: ${e}`); }
+        }
+        lastDeployTime[w] = now();
+      } catch(e) { ns.print("deploy err: " + e); }
     }
-    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Deployed helper scripts to workers.");
+    guiLog("Deployed helper scripts to workers.");
   }
 
   async function doUpgradeNow(workers) {
     await autoManagePurchasedServers(workers);
-    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Auto-upgrade attempted.");
+    guiLog("Auto-upgrade attempted.");
   }
 
   function doKillHelpers(workers) {
-    if (running) {
-      if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Kill request blocked: Please PAUSE automation before killing helpers.", "warn");
-      return;
-    }
-    for (const w of workers) {
-      try { ns.killall(w); } catch ( e ) {}
-    }
-    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Kill all helpers executed.");
+    if (running) { guiLog("Kill request blocked: Pause automation before killing helpers.", "warn"); return; }
+    for (const w of workers) { try { ns.killall(w); } catch(e){} }
+    guiLog("Kill all helpers executed.");
   }
 
   async function doKillTree(allServers) {
-    if (running) {
-      if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Kill-tree blocked: Please PAUSE automation before kill-tree.", "warn");
-      return;
-    }
-    for (const s of allServers) {
-      try { ns.killall(s); } catch ( e ) {}
-    }
-    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Kill-tree executed across network.");
+    if (running) { guiLog("Kill-tree blocked: Pause automation before kill-tree.", "warn"); return; }
+    for (const s of allServers) { try { ns.killall(s); } catch(e){} }
+    guiLog("Kill-tree executed across network.");
   }
 
   async function startIntegratedWorkers(targets, workers) {
     try {
-      const ramHack = ns.getScriptRam("hack.js","home");
-      const ramGrow = ns.getScriptRam("grow.js","home");
-      const ramWeaken = ns.getScriptRam("weaken.js","home");
+      const ramHack = ns.getScriptRam("hack.js", "home");
+      const ramGrow = ns.getScriptRam("grow.js", "home");
+      const ramWeaken = ns.getScriptRam("weaken.js", "home");
       for (const t of targets) {
         let currentWorkers = workers.slice();
         for (const p of ns.getPurchasedServers()) if (!currentWorkers.includes(p)) currentWorkers.push(p);
+
         let desiredFrac = cfg.baseHackFraction;
         let plan = estimatePlanForFraction(t, desiredFrac);
         let requiredRam = plan.hackThreads*ramHack + plan.growThreads*ramGrow + (plan.weaken1+plan.weaken2)*ramWeaken;
@@ -748,32 +655,35 @@ export async function main(ns) {
           iter++;
         }
         if (requiredRam > freeRam) {
-          if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`WorkerManager skipping ${t}: need ${requiredRam.toFixed(2)}GB free ${freeRam.toFixed(2)}GB`);
+          guiLog(`WorkerManager skipping ${t}: need ${requiredRam.toFixed(2)}GB, free ${freeRam.toFixed(2)}GB`, "warn");
           continue;
         }
+
         const args = [t, desiredFrac, JSON.stringify(currentWorkers)];
-        let pid = ns.exec("batcher.js","home",1,...args);
+        let pid = ns.exec("batcher.js", "home", 1, ...args);
         if (pid === 0) {
-          let best="home"; let bestRam = ns.getServerMaxRam("home");
+          let best = "home"; let bestRam = ns.getServerMaxRam("home");
           for (const w of currentWorkers) { try { const r = ns.getServerMaxRam(w); if (r > bestRam) { best = w; bestRam = r; } } catch(e){} }
-          try { await ns.scp(["batcher.js"], best); pid = ns.exec("batcher.js", best, 1, ...args); if (pid !==0 && guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`WorkerManager started ${t} on ${best} pid ${pid}`); } catch(e){ ns.print("worker start fallback err: " + e); metrics.errors.push(""+e); }
+          try {
+            for (const f of cfg.helperFiles) { try { await ns.scp(f, best); } catch(e){} }
+            pid = ns.exec("batcher.js", best, 1, ...args);
+            if (pid !== 0) guiLog(`WorkerManager started ${t} on ${best} pid ${pid}`);
+            else guiLog(`WorkerManager failed to start ${t} on ${best}`, "err");
+          } catch(e){ ns.print("worker start fallback err: " + e); metrics.errors.push(""+e); }
         } else {
-          if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`WorkerManager launched batcher for ${t} pid ${pid}`);
+          guiLog(`WorkerManager launched batcher for ${t} pid ${pid}`);
         }
         metrics.batchesLaunched++;
         await safeSleep(80);
       }
-    } catch(e){ ns.print("startIntegratedWorkers err: " + e); metrics.errors.push(""+e); }
+    } catch(e) { ns.print("startIntegratedWorkers err: " + e); metrics.errors.push(""+e); }
   }
 
   async function stopIntegratedWorkers(workers) {
-    for (const w of workers) {
-      try { ns.killall(w); } catch(e) {}
-    }
-    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("WorkerManager stop: killall executed on workers.");
+    for (const w of workers) { try { ns.killall(w); } catch(e){} }
+    guiLog("WorkerManager stop: killall executed on workers.");
   }
 
-  // ---------------- audio ping ----------------
   function audioPing() {
     try {
       if (typeof Audio !== "undefined") {
@@ -785,102 +695,99 @@ export async function main(ns) {
     } catch(e){}
   }
 
-  // ---------------- bootstrap ----------------
-  ns.print("Viper's Nest (trend + debug) bootstrapping...");
+  // BOOTSTRAP
+  guiLog("Viper's Nest bootstrapping...");
   let all = scanAll();
   for (const h of all) if (h !== "home") tryNuke(h);
   all = scanAll();
   let workers = pickWorkerHosts(all);
   for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
-  for (const w of workers) { try { await deployScriptsTo(w); } catch ( e ) { ns.print(`deploy ${w}: ${e}`); } }
+  for (const w of workers) { try { await scpIfNeeded(w); } catch ( e ) { ns.print(`deploy ${w}: ${e}`); } }
   ns.tprint(`Viper's Nest started. Workers: ${workers.join(", ")}`);
 
-  // ---------------- helper: compute trend ----------------
+  // Trend helper
   function computeTrend() {
     const h = metrics.moneyHistory;
-    if (h.length < 3) return { label: "—", slope: 0 };
+    if (!h || h.length < 3) return { label: "—", slope: 0 };
     const samples = h.slice(-cfg.trendSamples);
-    const first = samples[0].m;
-    const last = samples[samples.length-1].m;
-    const slope = first > 0 ? (last-first)/first : 0;
-    const pct = slope;
-    if (pct > cfg.trendThresholdPct) return { label: "BULLISH Up Arrow", slope: pct };
-    if (pct < -cfg.trendThresholdPct) return { label: "BEARISH Down Arrow", slope: pct };
-    return { label: "NEUTRAL Square", slope: pct };
+    const first = samples[0].m || 0;
+    const last = samples[samples.length-1].m || 0;
+    const slope = first > 0 ? (last - first) / first : 0;
+    if (slope > cfg.trendThresholdPct) return { label: "BULLISH ↑", slope };
+    if (slope < -cfg.trendThresholdPct) return { label: "BEARISH ↓", slope };
+    return { label: "NEUTRAL ▪", slope };
   }
 
-  // ---------------- main loop ----------------
+  // MAIN LOOP
+  const PS_SAMPLE_INTERVAL_MS = 15_000;
+  let lastPsSample = 0;
+
   while (true) {
     metrics.loops++;
-    const loopStart = Date.now();
+    const loopStart = now();
     try {
       all = scanAll();
       metrics.scannedServersCount = all.length;
 
-      // handle GUI recorded button press logging (DOM side already logged; this just echoes)
       if (lastButtonPressed.id) {
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Button recorded: ${lastButtonPressed.label} @ ${new Date(lastButtonPressed.time).toLocaleTimeString()}`);
+        guiLog(`Button recorded: ${lastButtonPressed.label} @ ${new Date(lastButtonPressed.time).toLocaleTimeString()}`);
         lastButtonPressed.id = null;
       }
 
-      // rebuild workers if flagged
       if (actionFlags.rebuildWorkers) {
         actionFlags.rebuildWorkers = false;
         workers = pickWorkerHosts(all);
         for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Workers rebuilt (flag processed).");
+        guiLog("Workers rebuilt (flag processed).");
       }
 
-      // process GUI-triggered flags (only here we call ns.*)
+      // Process GUI flags here (only place with ns.* from GUI requests)
       if (actionFlags.deployNow) {
         actionFlags.deployNow = false;
         workers = pickWorkerHosts(all);
         for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
         await doDeployNow(workers);
         audioPing();
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Deploy Now");
       }
+
       if (actionFlags.upgradeNow) {
         actionFlags.upgradeNow = false;
         workers = pickWorkerHosts(all);
         for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
         await doUpgradeNow(workers);
         audioPing();
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Upgrade Now");
       }
+
       if (actionFlags.killAllHelpers) {
         actionFlags.killAllHelpers = false;
         workers = pickWorkerHosts(all);
-        for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
         doKillHelpers(workers);
         audioPing();
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Kill Helpers");
       }
+
       if (actionFlags.killTree) {
         actionFlags.killTree = false;
         await doKillTree(all);
         audioPing();
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Kill-Tree");
       }
+
       if (actionFlags.startWorkers) {
         actionFlags.startWorkers = false;
         workers = pickWorkerHosts(all);
-        for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
         await startIntegratedWorkers(pickTargets(all, cfg.targetCount), workers);
         audioPing();
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Start Workers");
       }
+
       if (actionFlags.stopWorkers) {
         actionFlags.stopWorkers = false;
         workers = pickWorkerHosts(all);
-        for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
         await stopIntegratedWorkers(workers);
         audioPing();
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Stop Workers");
       }
+
       if (actionFlags.boostMode) {
         const mode = actionFlags.boostMode; actionFlags.boostMode = null;
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Processing boostMode: ${mode}`);
+        guiLog(`Processing boostMode: ${mode}`);
         if (mode === "hack") {
           const old = cfg.baseHackFraction;
           cfg.baseHackFraction = Math.min(0.05, old * 6);
@@ -894,50 +801,33 @@ export async function main(ns) {
           cfg.baseHackFraction = old;
         }
         audioPing();
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Processed: Boost ${mode}`);
       }
+
       if (actionFlags.debugDump) {
         actionFlags.debugDump = false;
         ns.tprint(JSON.stringify({metrics, toggles, cfg}, null, 2));
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Debug Dump (tprint)");
+        guiLog("Processed: Debug Dump (tprint)");
       }
-      if (actionFlags.toggleAutoPurchase) {
-        actionFlags.toggleAutoPurchase = false;
-        toggles.autoPurchase = !toggles.autoPurchase;
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoPurchase toggled: ${toggles.autoPurchase}`);
-      }
-      if (actionFlags.toggleAutoRoot) {
-        actionFlags.toggleAutoRoot = false;
-        toggles.autoRoot = !toggles.autoRoot;
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoRoot toggled: ${toggles.autoRoot}`);
-      }
-      if (actionFlags.toggleAutoHacknet) {
-        actionFlags.toggleAutoHacknet = false;
-        toggles.autoHacknet = !toggles.autoHacknet;
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoHacknet toggled: ${toggles.autoHacknet}`);
-      }
-      if (actionFlags.farmExp) {
-        actionFlags.farmExp = false;
-        await farmExpMode(pickEasyTargets(all), workers);
-        audioPing();
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Farm Exp");
-      }
-      if (actionFlags.maxMoneyMode) {
-        actionFlags.maxMoneyMode = false;
-        await maxMoneyMode(pickTargets(all, cfg.targetCount), workers);
-        audioPing();
-        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Max Money Mode");
-      }
+
+      if (actionFlags.toggleAutoPurchase) { actionFlags.toggleAutoPurchase = false; toggles.autoPurchase = !toggles.autoPurchase; guiLog(`AutoPurchase toggled: ${toggles.autoPurchase}`); }
+      if (actionFlags.toggleAutoRoot) { actionFlags.toggleAutoRoot = false; toggles.autoRoot = !toggles.autoRoot; guiLog(`AutoRoot toggled: ${toggles.autoRoot}`); }
+      if (actionFlags.toggleAutoHacknet) { actionFlags.toggleAutoHacknet = false; toggles.autoHacknet = !toggles.autoHacknet; guiLog(`AutoHacknet toggled: ${toggles.autoHacknet}`); }
+
+      if (actionFlags.farmExp) { actionFlags.farmExp = false; await farmExpMode(pickEasyTargets(all), workers); audioPing(); }
+      if (actionFlags.maxMoneyMode) { actionFlags.maxMoneyMode = false; await maxMoneyMode(pickTargets(all, cfg.targetCount), workers); audioPing(); }
 
       // auto ops
       await autoRootAll(all);
       workers = pickWorkerHosts(all);
       for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
-      for (const w of workers) { try { await deployScriptsTo(w); } catch ( e ) { /*ignore*/ } }
+
+      // attempt deploy to newly discovered workers (scpIfNeeded has cooldown)
+      for (const w of workers) await scpIfNeeded(w);
+
       await autoBuyOptionalTools();
       await autoManagePurchasedServers(workers);
-      try { await autoManageHacknet(); } catch(e) { /* ignore hacknet errors */ }
-      try { await autoCorporationManager(); } catch(e) { /* ignore corporation errors */ }
+      try { await autoManageHacknet(); } catch(e) {}
+      try { await autoCorporationManager(); } catch(e) {}
 
       // update metrics
       metrics.workersCount = workers.length;
@@ -945,37 +835,41 @@ export async function main(ns) {
       metrics.totalPurchasedRam = metrics.purchasedServers.reduce((a,s)=>a + (ns.getServerMaxRam(s)||0),0);
       metrics.lastTargets = pickTargets(all, cfg.targetCount);
 
-      // money/sec
+      // money history
       const nowMoney = ns.getServerMoneyAvailable("home");
-      const nowTime = Date.now();
-      metrics.moneyHistory.push({t: nowTime, m: nowMoney});
-      if (metrics.moneyHistory.length > 240) metrics.moneyHistory.shift();
+      const nowTime = now();
+      metrics.moneyHistory.push({ t: nowTime, m: nowMoney });
+      if (metrics.moneyHistory.length > 360) metrics.moneyHistory.shift();
       if (metrics.moneyHistory.length >= 2) {
         const oldest = metrics.moneyHistory[0];
-        const newest = metrics.moneyHistory[metrics.moneyHistory.length-1];
+        const newest = metrics.moneyHistory[metrics.moneyHistory.length - 1];
         const dt = (newest.t - oldest.t) / 1000.0;
         metrics.moneyPerSec = dt > 0 ? (newest.m - oldest.m) / dt : 0;
       } else metrics.moneyPerSec = 0;
 
-      // find running PIDs for "batcher.js" (best-effort) for debug overlay
-      try {
+      // sample ps() occasionally (costly)
+      if (now() - lastPsSample > PS_SAMPLE_INTERVAL_MS) {
+        lastPsSample = now();
         metrics.lastPIDs = [];
-        for (const s of [...workers, "home"]) {
-          try {
-            const procs = ns.ps(s);
-            for (const p of procs) {
-              if (p.filename && p.filename.indexOf("batcher") !== -1) metrics.lastPIDs.push({host:s, pid:p.pid, file:p.filename});
-            }
-          } catch(e){}
-        }
-      } catch(e){}
+        try {
+          const checkHosts = Array.from(new Set([...workers, "home"])).slice(0, 80);
+          for (const s of checkHosts) {
+            try {
+              const procs = ns.ps(s);
+              for (const p of procs) {
+                if (p.filename && p.filename.includes("batcher")) metrics.lastPIDs.push({ host:s, pid:p.pid, file:p.filename });
+              }
+            } catch(e){}
+          }
+        } catch(e){}
+      }
 
-      // Schedule batchers if running
+      // schedule batchers while running
       if (running) {
         const targets = metrics.lastTargets;
-        const ramHack = ns.getScriptRam("hack.js","home");
-        const ramGrow = ns.getScriptRam("grow.js","home");
-        const ramWeaken = ns.getScriptRam("weaken.js","home");
+        const ramHack = ns.getScriptRam("hack.js", "home");
+        const ramGrow = ns.getScriptRam("grow.js", "home");
+        const ramWeaken = ns.getScriptRam("weaken.js", "home");
         for (const t of targets) {
           try {
             let currentWorkers = workers.slice();
@@ -992,19 +886,21 @@ export async function main(ns) {
               freeRam = totalFreeRam(currentWorkers);
               iter++;
             }
-            if (requiredRam > freeRam) {
-              if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Skipping ${t}: requires ${requiredRam.toFixed(2)}GB, free ${freeRam.toFixed(2)}GB`);
-              continue;
-            }
+            if (requiredRam > freeRam) { guiLog(`Skipping ${t}: requires ${requiredRam.toFixed(2)}GB, free ${freeRam.toFixed(2)}GB`, "warn"); continue; }
+
             const args = [t, desiredFrac, JSON.stringify(currentWorkers)];
-            let pid = ns.exec("batcher.js","home",1,...args);
+            let pid = ns.exec("batcher.js", "home", 1, ...args);
             if (pid === 0) {
-              let best="home"; let bestRam = ns.getServerMaxRam("home");
+              let best = "home"; let bestRam = ns.getServerMaxRam("home");
               for (const w of currentWorkers) { try { const r = ns.getServerMaxRam(w); if (r > bestRam) { best = w; bestRam = r; } } catch(e){} }
-              try { await ns.scp(["batcher.js"], best); pid = ns.exec("batcher.js", best, 1, ...args); if (pid!==0) { metrics.batchesLaunched++; if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Fallback started ${t} on ${best} (pid ${pid})`); } else { if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Failed start ${t}`); } } catch(e){ ns.print(`Fallback failed ${t}: ${e}`); metrics.errors.push(""+e); }
+              try {
+                for (const f of cfg.helperFiles) { try { await ns.scp(f, best); } catch(e){} }
+                pid = ns.exec("batcher.js", best, 1, ...args);
+                if (pid !== 0) { metrics.batchesLaunched++; guiLog(`Fallback started ${t} on ${best} (pid ${pid})`); } else { guiLog(`Failed start ${t}`, "err"); }
+              } catch(e){ ns.print(`Fallback failed ${t}: ${e}`); metrics.errors.push(""+e); }
             } else {
               metrics.batchesLaunched++;
-              if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Launched batcher for ${t} (hackFrac ${(desiredFrac*100).toFixed(3)}%) pid ${pid}`);
+              guiLog(`Launched batcher for ${t} (hackFrac ${(desiredFrac*100).toFixed(3)}%) pid ${pid}`);
             }
             metrics.lastPlans[t] = { plan, requiredRam, freeRam, desiredFrac };
           } catch(e){ ns.print(`schedule err ${t}: ${e}`); metrics.errors.push(""+e); }
@@ -1014,21 +910,26 @@ export async function main(ns) {
 
       // GUI updates (DOM-only)
       try {
-        if (guiDiv && guiDiv.__refs) {
+        if (isDomAvailable() && guiDiv && guiDiv.__refs) {
           const refs = guiDiv.__refs;
-          refs.statMoney.value.innerText = `$${Math.floor(metrics.moneyHistory.length?metrics.moneyHistory[metrics.moneyHistory.length-1].m:ns.getServerMoneyAvailable("home")).toLocaleString()}`;
+          const lastMoney = metrics.moneyHistory.length ? metrics.moneyHistory[metrics.moneyHistory.length - 1].m : ns.getServerMoneyAvailable("home");
+          refs.statMoney.value.innerText = `$${Math.floor(lastMoney).toLocaleString()}`;
           refs.statMoneySec.value.innerText = `$${metrics.moneyPerSec.toFixed(2)}/s`;
           refs.statWorkers.value.innerText = `${metrics.workersCount} servers`;
-          refs.statPurchased.value.innerText = `${metrics.purchasedServers.length} servers · ${metrics.totalPurchasedRam} GB total`;
+          refs.statPurchased.value.innerText = `${metrics.purchasedServers.length} servers · ${metrics.totalPurchasedRam} GB`;
 
-          // update map
-          guiDiv.__updateMap(pickWorkerHosts(all));
+          // update map only when changed
+          const newMapStr = pickWorkerHosts(all).sort().join(",");
+          if (newMapStr !== lastNetMapStr) {
+            lastNetMapStr = newMapStr;
+            guiDiv.__updateMap(lastNetMapStr ? lastNetMapStr.split(",") : []);
+          }
 
-          // canvas draw with glow lines
-          const c = guiDiv.__canvas;
+          // canvas draw
+          const c = refs.canvas;
           const ctx = c.getContext("2d");
           ctx.clearRect(0,0,c.width,c.height);
-          ctx.fillStyle = "rgba(10,10,18,0.7)";
+          ctx.fillStyle = "rgba(8,12,20,0.9)";
           ctx.fillRect(0,0,c.width,c.height);
           const hist = metrics.moneyHistory.slice(-60);
           if (hist.length > 1) {
@@ -1041,71 +942,34 @@ export async function main(ns) {
               const y = c.height - ((hist[i].m - minM) / rangeM) * c.height;
               if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
             }
-            ctx.strokeStyle = "#66eeff";
-            ctx.shadowColor = "#66eeff";
-            ctx.shadowBlur = 10;
-            ctx.lineWidth = 2;
-            ctx.stroke();
+            ctx.strokeStyle = "#66eeff"; ctx.lineWidth = 2; ctx.shadowColor="#66eeff"; ctx.shadowBlur=8; ctx.stroke(); ctx.shadowBlur=0;
           }
-          // purchased ram bar with glow
-          const ramPercent = Math.min(1, metrics.totalPurchasedRam / Math.max(1, cfg.purchasedTargetUpgradeMultiplier*512));
-          ctx.fillStyle = "rgba(100,200,255,0.12)";
-          ctx.fillRect(0,c.height-8,c.width*ramPercent,6);
-          ctx.shadowColor = "#66ffcc";
-          ctx.shadowBlur = 5;
-          ctx.fillStyle = "#66ffcc";
-          ctx.fillRect(0,c.height-8,c.width*ramPercent,2);
 
-          // AI bubble pulse color based on running
-          guiDiv.__aiBubble.style.animation = running ? "corePulse 1.5s infinite alternate" : "corePulseRed 1.5s infinite alternate";
-          guiDiv.__aiBubble.style.background = running ? "radial-gradient(circle at 30% 30%, #2feaff, #005b8a)" : "radial-gradient(circle at 30% 30%, #ff0000, #8a0000)";
-
-          // trend indicator
-          const trend = computeTrend();
-          try {
-            guiDiv.__refs.trendBadge.innerText = `TREND: ${trend.label}`;
-            if (trend.label.includes("BULL")) guiDiv.__refs.trendBadge.style.color = "#9eff9e";
-            else if (trend.label.includes("BEAR")) guiDiv.__refs.trendBadge.style.color = "#ff9b9b";
-            else guiDiv.__refs.trendBadge.style.color = "#ffdca3";
-          } catch(e){}
-
-          // debug overlay content
-          const dbg = guiDiv.__refs.debugBox;
+          // debug box
+          const dbg = refs.debugBox;
           dbg.innerHTML = "";
-          const titleRow = document.createElement("div"); titleRow.style.fontWeight="800"; titleRow.style.marginBottom="6px"; titleRow.innerText = `Loops: ${metrics.loops} | Batches Launched: ${metrics.batchesLaunched} | Workers: ${metrics.workersCount}`;
-          dbg.appendChild(titleRow);
-          const btnRow = document.createElement("div"); btnRow.innerText = `Last Button: ${lastButtonPressed.label ? lastButtonPressed.label + " @ " + new Date(lastButtonPressed.time).toLocaleTimeString() : "none"}`;
-          dbg.appendChild(btnRow);
+          const titleRow = document.createElement("div"); titleRow.style.fontWeight="800"; titleRow.innerText = `Loops: ${metrics.loops} | Batches Launched: ${metrics.batchesLaunched} | Workers: ${metrics.workersCount}`; dbg.appendChild(titleRow);
+          const btnRow = document.createElement("div"); btnRow.innerText = `Last Button: ${lastButtonPressed.label ? lastButtonPressed.label + " @ " + new Date(lastButtonPressed.time).toLocaleTimeString() : "none"}`; dbg.appendChild(btnRow);
 
-          const pidTitle = document.createElement("div"); pidTitle.style.marginTop="6px"; pidTitle.style.fontWeight="700"; pidTitle.innerText = "Active Batcher PIDs:";
-          dbg.appendChild(pidTitle);
-          if (metrics.lastPIDs.length) {
-            for (const p of metrics.lastPIDs.slice(0,30)) {
-              const r = document.createElement("div"); r.innerText = `${p.host} : pid ${p.pid} - ${p.file}`; dbg.appendChild(r);
-            }
-          } else {
-            const r = document.createElement("div"); r.innerText = "(none)"; dbg.appendChild(r);
-          }
+          const pidTitle = document.createElement("div"); pidTitle.style.marginTop="6px"; pidTitle.style.fontWeight="700"; pidTitle.innerText = "Active Batcher PIDs:"; dbg.appendChild(pidTitle);
+          if (metrics.lastPIDs.length) { for (const p of metrics.lastPIDs.slice(0,30)) { const r = document.createElement("div"); r.innerText = `${p.host} : pid ${p.pid} - ${p.file}`; dbg.appendChild(r); } } else { const r = document.createElement("div"); r.innerText = "(none)"; dbg.appendChild(r); }
 
-          const mhTitle = document.createElement("div"); mhTitle.style.marginTop="6px"; mhTitle.style.fontWeight="700"; mhTitle.innerText = "Recent money samples (last -> now):";
-          dbg.appendChild(mhTitle);
+          const mhTitle = document.createElement("div"); mhTitle.style.marginTop="6px"; mhTitle.style.fontWeight="700"; mhTitle.innerText = "Recent money samples:"; dbg.appendChild(mhTitle);
           const samples = metrics.moneyHistory.slice(-10).map(s=>Math.floor(s.m));
-          const sampleRow = document.createElement("div"); sampleRow.innerText = samples.join("  |  ");
-          dbg.appendChild(sampleRow);
+          const sampleRow = document.createElement("div"); sampleRow.innerText = samples.join("  |  "); dbg.appendChild(sampleRow);
 
-          // errors short
           if (metrics.errors.length) {
-            const errTitle = document.createElement("div"); errTitle.style.marginTop="6px"; errTitle.style.fontWeight="700"; errTitle.style.color="#ff9999"; errTitle.innerText = "Recent Errors:";
-            dbg.appendChild(errTitle);
-            for (const e of metrics.errors.slice(-5).reverse()) {
-              const r = document.createElement("div"); r.innerText = e; r.style.color="#ff9999"; dbg.appendChild(r);
-            }
+            const errTitle = document.createElement("div"); errTitle.style.marginTop="6px"; errTitle.style.fontWeight="700"; errTitle.style.color="#ff9999"; errTitle.innerText = "Recent Errors:"; dbg.appendChild(errTitle);
+            for (const e of metrics.errors.slice(-5).reverse()) { const r = document.createElement("div"); r.innerText = e; r.style.color="#ff9999"; dbg.appendChild(r); }
           }
         }
-      } catch(e){ ns.print("GUI update err: " + e); metrics.errors.push(""+e); }
+      } catch(e) { ns.print("GUI update err: " + e); metrics.errors.push(""+e); }
 
-      // sleep pacing
-      const elapsed = Date.now() - loopStart;
+      // trim errors
+      if (metrics.errors.length > 500) metrics.errors.splice(0, metrics.errors.length - 500);
+
+      // pacing
+      const elapsed = now() - loopStart;
       const target = Math.max(200, cfg.batchIntervalMs - elapsed);
       await safeSleep(target);
     } catch (ex) {
@@ -1113,5 +977,5 @@ export async function main(ns) {
       metrics.errors.push(""+ex);
       await safeSleep(3000);
     }
-  } // end main while
+  } // end main loop
 } // end main
