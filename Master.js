@@ -32,7 +32,7 @@ export async function main(ns) {
     helperFiles: ["hack.js", "grow.js", "weaken.js", "batcher.js"],
     trendSamples: 12,
     trendThresholdPct: 0.03,
-    // Hacknet configuration
+    // Hacknet причины configuration
     hacknetBudgetFraction: 0.12,
     hacknetUpgradePriority: ["level","ram","cores"]
   };
@@ -50,12 +50,7 @@ export async function main(ns) {
     stopWorkers: false,
     killTree: false,
     boostMode: null,        // "hack"|"grow"|"weaken"|null
-    debugDump: false,
-    toggleAutoPurchase: false,
-    toggleAutoRoot: false,
-    toggleAutoHacknet: false,
-    farmExp: false,
-    maxMoneyMode: false
+    debugDump: false
   };
   const toggles = {
     autoPurchase: true,
@@ -570,9 +565,9 @@ export async function main(ns) {
     right.appendChild(controls);
 
     // map card with glow
-    const mapCard = document.createElement("div"); Object.assign(mapCard.style, {background:"linear-gradient(180deg, rgba(0,0,0,0.12), rgba(0,0,0,0.06))", border:"1px solid rgba(0,255,255,0.2)", borderRadius:"8px", padding:"8px", minHeight:"100px", overflow:"auto", boxShadow: "0 0 10px rgba(0,255,255,0.15)"});
+    const mapCard = document.createElement("div"); Object.assign(mapCard.style, {background:"linear-gradient(180deg, rgba(0,0,0,0.12), rgba(0,0,0,0.06))", border:"1px solid rgba(0,255,255,0.2)", borderRadius:"8px", padding:"8px", minHeight:"60px", maxHeight:"60px", overflowY:"auto", boxShadow: "0 0 10px rgba(0,255,255,0.15)"});
     const mapTitle = document.createElement("div"); mapTitle.innerText = "Network Map (rooted)"; mapTitle.style.color="#a8eaff"; mapTitle.style.fontSize="11px"; mapTitle.style.textShadow = "0 0 4px #a8eaff"; mapCard.appendChild(mapTitle);
-    const mapList = document.createElement("div"); mapList.style.fontSize="12px"; mapList.style.color="#dffaff"; mapList.style.marginTop="6px"; mapList.style.textShadow = "0 0 4px #dffaff"; mapCard.appendChild(mapList);
+    const mapList = document.createElement("div"); mapList.style.fontSize="10px"; mapList.style.color="#dffaff"; mapList.style.marginTop="4px"; mapList.style.textShadow = "0 0 4px #dffaff"; mapCard.appendChild(mapList);
     right.appendChild(mapCard);
 
     // AI card with pulsating core
@@ -686,12 +681,12 @@ export async function main(ns) {
   } // createGUI end
 
   // create GUI initially
-  try { createGUI(); } catch (e) { ns.print("GUI create error: " + e); }
+  try { createGUI(); } catch ( e ) { ns.print("GUI create error: " + e); }
 
   // ---------------- Action implementations (called from main loop) ----------------
   async function doDeployNow(workers) {
     for (const w of workers) {
-      try { await deployScriptsTo(w); } catch (e) { ns.print("deploy err: " + e); }
+      try { await deployScriptsTo(w); } catch ( e ) { ns.print("deploy err: " + e); }
     }
     if (guiDiv) guiDiv.__pushLog("Deployed helper scripts to workers.");
   }
@@ -707,7 +702,7 @@ export async function main(ns) {
       return;
     }
     for (const w of workers) {
-      try { ns.killall(w); } catch (e) {}
+      try { ns.killall(w); } catch ( e ) {}
     }
     if (guiDiv) guiDiv.__pushLog("Kill all helpers executed.");
   }
@@ -718,7 +713,7 @@ export async function main(ns) {
       return;
     }
     for (const s of allServers) {
-      try { ns.killall(s); } catch (e) {}
+      try { ns.killall(s); } catch ( e ) {}
     }
     if (guiDiv) guiDiv.__pushLog("Kill-tree executed across network.");
   }
@@ -788,7 +783,7 @@ export async function main(ns) {
   all = scanAll();
   let workers = pickWorkerHosts(all);
   for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
-  for (const w of workers) { try { await deployScriptsTo(w); } catch (e) { ns.print(`deploy ${w}: ${e}`); } }
+  for (const w of workers) { try { await deployScriptsTo(w); } catch ( e ) { ns.print(`deploy ${w}: ${e}`); } }
   ns.tprint(`Viper's Nest started. Workers: ${workers.join(", ")}`);
 
   // ---------------- helper: compute trend ----------------
@@ -929,7 +924,7 @@ export async function main(ns) {
       await autoRootAll(all);
       workers = pickWorkerHosts(all);
       for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
-      for (const w of workers) { try { await deployScriptsTo(w); } catch (e) { /*ignore*/ } }
+      for (const w of workers) { try { await deployScriptsTo(w); } catch ( e ) { /*ignore*/ } }
       await autoBuyOptionalTools();
       await autoManagePurchasedServers(workers);
       try { await autoManageHacknet(); } catch(e) { /* ignore hacknet errors */ }
