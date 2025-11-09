@@ -50,7 +50,12 @@ export async function main(ns) {
     stopWorkers: false,
     killTree: false,
     boostMode: null,        // "hack"|"grow"|"weaken"|null
-    debugDump: false
+    debugDump: false,
+    toggleAutoPurchase: false,
+    toggleAutoRoot: false,
+    toggleAutoHacknet: false,
+    farmExp: false,
+    maxMoneyMode: false
   };
   const toggles = {
     autoPurchase: true,
@@ -179,6 +184,20 @@ export async function main(ns) {
     return candidates.slice(0, count).map(c=>c.host);
   }
 
+  function pickEasyTargets(allServers) {
+    const candidates = [];
+    for (const s of allServers) {
+      if (s === "home") continue;
+      try {
+        const req = ns.getServerRequiredHackingLevel(s);
+        if (req > ns.getHackingLevel() / 2) continue;
+        if (!ns.hasRootAccess(s)) continue;
+        candidates.push(s);
+      } catch(e){}
+    }
+    return candidates.slice(0, 5);
+  }
+
   // ---------------- Purchased servers manager (conservative) ----------------
   async function autoManagePurchasedServers(workers) {
     try {
@@ -293,7 +312,7 @@ export async function main(ns) {
           try {
             if (u.type === "level") ok = ns.hacknet.upgradeLevel(u.node, 1);
             else if (u.type === "ram") ok = ns.hacknet.upgradeRam(u.node, 1);
-            else if (u.type === "cores" || u.type === "cores") ok = ns.hacknet.upgradeCore(u.node, 1);
+            else if (u.type === "cores") ok = ns.hacknet.upgradeCore(u.node, 1);
           } catch(e){}
           if (ok) {
             if (guiDiv) guiDiv.__pushLog(`Hacknet: upgraded node ${u.node} ${u.type} (+1) cost $${Math.floor(u.cost)}`);
@@ -365,9 +384,9 @@ export async function main(ns) {
           }
         } catch(e) {
           try {
-            const industries = ns.corporation.getIndustries();
+            const industries = ns.corporation.getConstants().industries;
             if (industries && industries.length) {
-              const fallback = industries[0].name || industries[0];
+              const fallback = industries[0];
               ns.corporation.expandIndustry(fallback, divName);
               if (guiDiv) guiDiv.__pushLog(`AutoCorp: expanded industry ${fallback} as ${divName} (fallback).`);
             }
@@ -378,7 +397,7 @@ export async function main(ns) {
           const div = ns.corporation.getDivision(divName);
           if (div && !div.cities.includes(city)) {
             ns.corporation.expandCity(divName, city);
-            try { ns.corporation.expandOffice(divName, city, 3); } catch(e){}
+            try { ns.corporation.purchaseOffice(divName, city, 3); } catch(e){}
             if (guiDiv) guiDiv.__pushLog(`AutoCorp: opened ${divName} office in ${city}.`);
           }
         } catch(e) {}
@@ -386,12 +405,42 @@ export async function main(ns) {
           const divs = ns.corporation.getCorporation().divisions;
           if (divs && divs.length) {
             for (const d of divs) {
-              try { ns.corporation.hireEmployee(d.name || d, "Aevum", 3); } catch(e){}
+              try { ns.corporation.hireEmployee(d.name, "Aevum"); } catch(e){}
+              try { ns.corporation.makeProduct(d.name, "Aevum", "Prod" + Math.random().toString(36).slice(2,7), 1e6, 1e6); } catch(e){}
+              try { ns.corporation.sellProduct(d.name, "Aevum", "Prod" + Math.random().toString(36).slice(2,7), "MAX", "MP", true); } catch(e){}
             }
           }
         } catch(e){}
       } catch(e){ ns.print(`AutoCorp operations error: ${e}`); metrics.errors.push(""+e); }
     } catch(e){ ns.print(`AutoCorp handler error: ${e}`); metrics.errors.push(""+e); }
+  }
+
+  // ---------------- Exp Farming ----------------
+  async function farmExpMode(targets, workers) {
+    try {
+      for (const t of targets) {
+        const threads = Math.floor(totalFreeRam(workers) / ns.getScriptRam("weaken.js"));
+        if (threads > 0) {
+          ns.exec("weaken.js", workers[0], threads, t);
+          await safeSleep(100);
+          ns.exec("hack.js", workers[0], Math.floor(threads/10), t);
+          if (guiDiv) guiDiv.__pushLog(`Farming exp on ${t} with ${threads} threads`);
+        }
+      }
+    } catch(e) { metrics.errors.push(""+e); }
+  }
+
+  // ---------------- Max Money Mode ----------------
+  async function maxMoneyMode(targets, workers) {
+    const oldFrac = cfg.baseHackFraction;
+    cfg.baseHackFraction = 0.05;
+    for (let i=0; i<5; i++) {
+      await startIntegratedWorkers(targets, workers);
+      await safeSleep(500);
+    }
+    try { ns.share(); } catch(e){}
+    cfg.baseHackFraction = oldFrac;
+    if (guiDiv) guiDiv.__pushLog("Max Money Mode activated - high hack + share");
   }
 
   // ---------------- GUI Implementation ----------------
@@ -400,29 +449,30 @@ export async function main(ns) {
     if (guiDiv && !force) return;
     if (guiDiv && force) try { guiDiv.remove(); } catch(e){}
 
-    // root div
+    // root div with sci-fi glow
     guiDiv = document.createElement("div");
     guiDiv.id = "vipers-nest";
     Object.assign(guiDiv.style, {
       position: "fixed", top: "18px", left: "18px", width: "640px", zIndex: 99999,
       fontFamily: "Inter, Arial, sans-serif", color: "#cfefff", borderRadius: "12px",
-      boxShadow: "0 10px 30px rgba(0,0,0,0.6)", background: "linear-gradient(135deg, rgba(6,6,15,0.95), rgba(12,8,25,0.95))",
-      border: "1px solid rgba(120,200,255,0.12)", overflow: "hidden", userSelect: "none",
+      boxShadow: "0 0 20px rgba(0,255,255,0.5), 0 0 40px rgba(0,255,255,0.3)", background: "linear-gradient(135deg, rgba(6,6,15,0.95), rgba(12,8,25,0.95))",
+      border: "1px solid rgba(0,255,255,0.3)", overflow: "hidden", userSelect: "none",
       transition: "all 0.3s ease-in-out"
     });
 
-    // header
+    // header with neon text
     const header = document.createElement("div");
     header.style.display = "flex"; header.style.alignItems = "center"; header.style.padding = "8px 12px"; header.style.gap = "10px";
-    const title = document.createElement("div"); title.innerText = "Viper's Nest — Master (trend + debug)"; Object.assign(title.style, {fontWeight:"900", fontSize:"15px", color:"#6fffd1", textShadow:"0 0 6px #66ffff"});
+    header.style.boxShadow = "0 2px 10px rgba(0,255,255,0.2)";
+    const title = document.createElement("div"); title.innerText = "Viper's Nest — Master (trend + debug)"; Object.assign(title.style, {fontWeight:"900", fontSize:"15px", color:"#6fffd1", textShadow:"0 0 6px #66ffff, 0 0 12px #66ffff"});
     header.appendChild(title);
     const spacer = document.createElement("div"); spacer.style.flex = "1"; header.appendChild(spacer);
-    const pauseInfo = document.createElement("div"); pauseInfo.innerText = "⚠ PAUSE REQUIRED before Kill/Restart"; Object.assign(pauseInfo.style, {fontSize:"11px", color:"#ffdca3", fontWeight:"700", marginRight:"8px"});
+    const pauseInfo = document.createElement("div"); pauseInfo.innerText = "⚠ PAUSE REQUIRED before Kill/Restart"; Object.assign(pauseInfo.style, {fontSize:"11px", color:"#ffdca3", fontWeight:"700", marginRight:"8px", textShadow:"0 0 4px #ffdca3"});
     header.appendChild(pauseInfo);
 
-    const btnMin = document.createElement("button"); btnMin.innerText = "▢"; btnMin.title = "Minimize"; Object.assign(btnMin.style, {background:"transparent",border:"none",color:"#88dfff",cursor:"pointer",fontSize:"14px",fontWeight:"700"});
+    const btnMin = document.createElement("button"); btnMin.innerText = "▢"; btnMin.title = "Minimize"; Object.assign(btnMin.style, {background:"transparent",border:"none",color:"#88dfff",cursor:"pointer",fontSize:"14px",fontWeight:"700", textShadow:"0 0 4px #88dfff"});
     header.appendChild(btnMin);
-    const btnClose = document.createElement("button"); btnClose.innerText = "✕"; btnClose.title = "Close (vipersNestMenu() to reopen)"; Object.assign(btnClose.style, {background:"transparent",border:"none",color:"#ff9b9b",cursor:"pointer",fontSize:"14px",fontWeight:"700"});
+    const btnClose = document.createElement("button"); btnClose.innerText = "✕"; btnClose.title = "Close (vipersNestMenu() to reopen)"; Object.assign(btnClose.style, {background:"transparent",border:"none",color:"#ff9b9b",cursor:"pointer",fontSize:"14px",fontWeight:"700", textShadow:"0 0 4px #ff9b9b"});
     header.appendChild(btnClose);
 
     guiDiv.appendChild(header);
@@ -430,12 +480,12 @@ export async function main(ns) {
     // content grid
     const content = document.createElement("div"); content.style.display = "grid"; content.style.gridTemplateColumns = "1fr 1fr"; content.style.gap = "10px"; content.style.padding = "8px 12px 12px 12px";
 
-    // make card helper (animated)
+    // make card helper (animated with glow)
     function makeCard(titleText) {
       const c = document.createElement("div");
       Object.assign(c.style, {
         background: "linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))",
-        border: "1px solid rgba(100,180,255,0.06)",
+        border: "1px solid rgba(0,255,255,0.2)",
         borderRadius: "8px",
         padding: "8px",
         minHeight: "56px",
@@ -443,10 +493,11 @@ export async function main(ns) {
         flexDirection: "column",
         justifyContent: "space-between",
         transition: "all 0.5s ease",
-        overflow: "hidden"
+        overflow: "hidden",
+        boxShadow: "0 0 10px rgba(0,255,255,0.1)"
       });
-      const t = document.createElement("div"); t.innerText = titleText; t.style.fontSize = "11px"; t.style.color = "#8fdfff"; t.style.fontWeight="700"; c.appendChild(t);
-      const v = document.createElement("div"); v.innerText = "..."; v.style.fontSize = "16px"; v.style.fontWeight = "800"; v.style.color = "#dffeff"; v.style.transition="all 0.4s ease"; c.appendChild(v);
+      const t = document.createElement("div"); t.innerText = titleText; t.style.fontSize = "11px"; t.style.color = "#8fdfff"; t.style.fontWeight="700"; t.style.textShadow = "0 0 4px #8fdfff"; c.appendChild(t);
+      const v = document.createElement("div"); v.innerText = "..."; v.style.fontSize = "16px"; v.style.fontWeight = "800"; v.style.color = "#dffeff"; v.style.transition="all 0.4s ease"; v.style.textShadow = "0 0 6px #dffeff"; c.appendChild(v);
       return {card:c, title:t, value:v};
     }
 
@@ -459,12 +510,12 @@ export async function main(ns) {
     const left = document.createElement("div"); left.style.display="flex"; left.style.flexDirection="column"; left.style.gap="8px";
     left.appendChild(statMoney.card); left.appendChild(statMoneySec.card); left.appendChild(statWorkers.card); left.appendChild(statPurchased.card);
 
-    // graph card
+    // graph card with tech border
     const graphCard = document.createElement("div");
-    Object.assign(graphCard.style, {background:"rgba(255,255,255,0.01)", border:"1px solid rgba(120,200,255,0.06)", borderRadius:"8px", padding:"6px", minHeight:"120px"});
+    Object.assign(graphCard.style, {background:"rgba(255,255,255,0.01)", border:"1px solid rgba(0,255,255,0.2)", borderRadius:"8px", padding:"6px", minHeight:"120px", boxShadow: "0 0 10px rgba(0,255,255,0.15)"});
     const graphTitleRow = document.createElement("div"); graphTitleRow.style.display="flex"; graphTitleRow.style.justifyContent="space-between"; graphTitleRow.style.alignItems="center";
-    const graphTitle = document.createElement("div"); graphTitle.innerText="Performance Graph"; graphTitle.style.color="#a8eaff"; graphTitle.style.fontSize="11px";
-    const trendBadge = document.createElement("div"); trendBadge.innerText = "TREND: —"; Object.assign(trendBadge.style,{fontSize:"12px", fontWeight:"800", color:"#dffeff"});
+    const graphTitle = document.createElement("div"); graphTitle.innerText="Performance Graph"; graphTitle.style.color="#a8eaff"; graphTitle.style.fontSize="11px"; graphTitle.style.textShadow = "0 0 4px #a8eaff";
+    const trendBadge = document.createElement("div"); trendBadge.innerText = "TREND: —"; Object.assign(trendBadge.style,{fontSize:"12px", fontWeight:"800", color:"#dffeff", textShadow: "0 0 4px #dffeff"});
     graphTitleRow.appendChild(graphTitle); graphTitleRow.appendChild(trendBadge);
     graphCard.appendChild(graphTitleRow);
     const canvas = document.createElement("canvas"); canvas.width = 560; canvas.height = 110; canvas.style.width="100%"; canvas.style.height="110px"; graphCard.appendChild(canvas);
@@ -483,15 +534,17 @@ export async function main(ns) {
       Object.assign(b.style, {
         padding: "8px 10px",
         borderRadius: "8px",
-        border: "none",
+        border: "1px solid rgba(0,255,255,0.3)",
         background: color || "linear-gradient(180deg, #3a3f5a, #1b1d2a)",
-        color: "#000",
+        color: "#ffffff",
         fontWeight: "800",
         cursor: "pointer",
-        transition: "transform 0.12s ease, box-shadow 0.12s ease"
+        transition: "transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease",
+        boxShadow: "0 0 10px rgba(0,255,255,0.4)",
+        animation: "subtlePulse 2s infinite"
       });
-      b.onmouseenter = () => { b.style.transform = "translateY(-3px)"; b.style.boxShadow = "0 10px 20px rgba(0,0,0,0.3)"; };
-      b.onmouseleave = () => { b.style.transform = "translateY(0)"; b.style.boxShadow = "none"; };
+      b.onmouseenter = () => { b.style.transform = "scale(1.05)"; b.style.boxShadow = "0 0 20px rgba(0,255,255,0.8)"; };
+      b.onmouseleave = () => { b.style.transform = "scale(1)"; b.style.boxShadow = "0 0 10px rgba(0,255,255,0.4)"; };
       return b;
     }
 
@@ -507,27 +560,33 @@ export async function main(ns) {
     const btnBoostGrow = mkBtn("Boost Grow","Temporary aggressive grow mode","vn_boost_grow","linear-gradient(180deg,#6fffd1,#2feaff)");
     const btnBoostWeaken = mkBtn("Boost Weaken","Temporary heavy weaken mode","vn_boost_weaken","linear-gradient(180deg,#9eff9e,#66ff66)");
     const btnDebugDump = mkBtn("Debug Dump","Dump debug info to log","vn_debugdump","linear-gradient(180deg,#d0d0ff,#a0a0ff)");
+    const btnToggleAutoPurchase = mkBtn("Toggle AutoPurchase","Toggle auto server purchase","vn_toggle_autopurchase","linear-gradient(180deg,#ff6fcf,#ff88ff)");
+    const btnToggleAutoRoot = mkBtn("Toggle AutoRoot","Toggle auto rooting","vn_toggle_autoroot","linear-gradient(180deg,#6f9fff,#4f6fff)");
+    const btnToggleAutoHacknet = mkBtn("Toggle AutoHacknet","Toggle auto hacknet upgrades","vn_toggle_autohacknet","linear-gradient(180deg,#9eff9e,#66ff66)");
+    const btnFarmExp = mkBtn("Farm Exp","Farm hacking exp on easy targets","vn_farm_exp","linear-gradient(180deg,#fffc6f,#ffea6f)");
+    const btnMaxMoney = mkBtn("Max Money Mode","Aggressive money farming","vn_max_money","linear-gradient(180deg,#ff6fcf,#ff88ff)");
 
-    [btnStart,btnPause,btnDeploy,btnUpgrade,btnKill,btnKillTree,btnStartWorkers,btnStopWorkers,btnBoostHack,btnBoostGrow,btnBoostWeaken,btnDebugDump].forEach(b=>controls.appendChild(b));
+    [btnStart,btnPause,btnDeploy,btnUpgrade,btnKill,btnKillTree,btnStartWorkers,btnStopWorkers,btnBoostHack,btnBoostGrow,btnBoostWeaken,btnDebugDump,btnToggleAutoPurchase,btnToggleAutoRoot,btnToggleAutoHacknet,btnFarmExp,btnMaxMoney].forEach(b=>controls.appendChild(b));
     right.appendChild(controls);
 
-    // map card
-    const mapCard = document.createElement("div"); Object.assign(mapCard.style, {background:"linear-gradient(180deg, rgba(0,0,0,0.12), rgba(0,0,0,0.06))", border:"1px solid rgba(120,200,255,0.06)", borderRadius:"8px", padding:"8px", minHeight:"100px", overflow:"auto"});
-    const mapTitle = document.createElement("div"); mapTitle.innerText = "Network Map (rooted)"; mapTitle.style.color="#a8eaff"; mapTitle.style.fontSize="11px"; mapCard.appendChild(mapTitle);
-    const mapList = document.createElement("div"); mapList.style.fontSize="12px"; mapList.style.color="#dffaff"; mapList.style.marginTop="6px"; mapCard.appendChild(mapList);
+    // map card with glow
+    const mapCard = document.createElement("div"); Object.assign(mapCard.style, {background:"linear-gradient(180deg, rgba(0,0,0,0.12), rgba(0,0,0,0.06))", border:"1px solid rgba(0,255,255,0.2)", borderRadius:"8px", padding:"8px", minHeight:"100px", overflow:"auto", boxShadow: "0 0 10px rgba(0,255,255,0.15)"});
+    const mapTitle = document.createElement("div"); mapTitle.innerText = "Network Map (rooted)"; mapTitle.style.color="#a8eaff"; mapTitle.style.fontSize="11px"; mapTitle.style.textShadow = "0 0 4px #a8eaff"; mapCard.appendChild(mapTitle);
+    const mapList = document.createElement("div"); mapList.style.fontSize="12px"; mapList.style.color="#dffaff"; mapList.style.marginTop="6px"; mapList.style.textShadow = "0 0 4px #dffaff"; mapCard.appendChild(mapList);
     right.appendChild(mapCard);
 
-    // AI card
-    const aiCard = document.createElement("div"); Object.assign(aiCard.style, {display:"flex",alignItems:"center",gap:"10px",background:"linear-gradient(180deg, rgba(5,10,20,0.2), rgba(0,0,0,0.05))",border:"1px solid rgba(120,200,255,0.06)",borderRadius:"8px",padding:"8px"});
-    const aiBubble = document.createElement("div"); Object.assign(aiBubble.style,{width:"46px",height:"46px",borderRadius:"999px",background:"radial-gradient(circle at 30% 30%, #2feaff, #005b8a)",boxShadow:"0 8px 20px rgba(47,234,255,0.08)"}); aiCard.appendChild(aiBubble);
-    const aiText = document.createElement("div"); aiText.style.display="flex"; aiText.style.flexDirection="column"; aiText.innerHTML = `<div style="font-weight:700;color:#aeefff">Assistant Core</div><div style="font-size:11px;color:#cfefff">Status: active</div>`;
+    // AI card with pulsating core
+    const aiCard = document.createElement("div"); Object.assign(aiCard.style, {display:"flex",alignItems:"center",gap:"10px",background:"linear-gradient(180deg, rgba(5,10,20,0.2), rgba(0,0,0,0.05))",border:"1px solid rgba(0,255,255,0.2)",borderRadius:"8px",padding:"8px", boxShadow: "0 0 10px rgba(0,255,255,0.15)"});
+    const aiBubble = document.createElement("div"); Object.assign(aiBubble.style,{width:"46px",height:"46px",borderRadius:"999px",background:"radial-gradient(circle at 30% 30%, #2feaff, #005b8a)",boxShadow:"0 8px 20px rgba(47,234,255,0.08)", transition: "all 0.5s ease", animation: "corePulse 1.5s infinite alternate"});
+    aiCard.appendChild(aiBubble);
+    const aiText = document.createElement("div"); aiText.style.display="flex"; aiText.style.flexDirection="column"; aiText.innerHTML = `<div style="font-weight:700;color:#aeefff; text-shadow:0 0 4px #aeefff">Assistant Core</div><div style="font-size:11px;color:#cfefff; text-shadow:0 0 4px #cfefff">Status: active</div>`;
     aiCard.appendChild(aiText);
     right.appendChild(aiCard);
 
-    // debug overlay
-    const debugCard = document.createElement("div"); Object.assign(debugCard.style, {gridColumn:"1/span 2", minHeight:"120px", maxHeight:"220px", overflow:"auto", padding:"8px", borderRadius:"8px", border:"1px solid rgba(255,200,100,0.06)", background:"linear-gradient(180deg, rgba(8,8,12,0.25), rgba(0,0,0,0.06))"});
-    const debugTitle = document.createElement("div"); debugTitle.innerText="Debug Overlay (visible)"; debugTitle.style.color="#ffdca3"; debugTitle.style.fontSize="12px"; debugCard.appendChild(debugTitle);
-    const debugBox = document.createElement("div"); debugBox.style.color="#dffaff"; debugBox.style.fontSize="12px"; debugBox.style.marginTop="6px"; debugCard.appendChild(debugBox);
+    // debug overlay with subtle glow
+    const debugCard = document.createElement("div"); Object.assign(debugCard.style, {gridColumn:"1/span 2", minHeight:"120px", maxHeight:"220px", overflow:"auto", padding:"8px", borderRadius:"8px", border:"1px solid rgba(255,200,100,0.2)", background:"linear-gradient(180deg, rgba(8,8,12,0.25), rgba(0,0,0,0.06))", boxShadow: "0 0 10px rgba(255,200,100,0.15)"});
+    const debugTitle = document.createElement("div"); debugTitle.innerText="Debug Overlay (visible)"; debugTitle.style.color="#ffdca3"; debugTitle.style.fontSize="12px"; debugTitle.style.textShadow = "0 0 4px #ffdca3"; debugCard.appendChild(debugTitle);
+    const debugBox = document.createElement("div"); debugBox.style.color="#dffaff"; debugBox.style.fontSize="12px"; debugBox.style.marginTop="6px"; debugBox.style.textShadow = "0 0 4px #dffaff"; debugCard.appendChild(debugBox);
 
     // attach layout
     content.appendChild(left); content.appendChild(right); guiDiv.appendChild(content); guiDiv.appendChild(debugCard);
@@ -545,6 +604,7 @@ export async function main(ns) {
       const row = document.createElement("div");
       row.innerText = `[${time}] ${msg}`;
       row.style.marginBottom = "4px";
+      row.style.textShadow = "0 0 4px currentColor";
       if (level === "warn") row.style.color = "#ffcc66";
       if (level === "err") row.style.color = "#ff9999";
       try { debugBox.prepend(row); } catch(e){}
@@ -579,6 +639,11 @@ export async function main(ns) {
     btnBoostGrow.onclick = () => { recordButtonPress("vn_boost_grow","Boost Grow"); actionFlags.boostMode = "grow"; };
     btnBoostWeaken.onclick = () => { recordButtonPress("vn_boost_weaken","Boost Weaken"); actionFlags.boostMode = "weaken"; };
     btnDebugDump.onclick = () => { recordButtonPress("vn_debugdump","Debug Dump"); actionFlags.debugDump = true; };
+    btnToggleAutoPurchase.onclick = () => { recordButtonPress("vn_toggle_autopurchase","Toggle AutoPurchase"); actionFlags.toggleAutoPurchase = true; };
+    btnToggleAutoRoot.onclick = () => { recordButtonPress("vn_toggle_autoroot","Toggle AutoRoot"); actionFlags.toggleAutoRoot = true; };
+    btnToggleAutoHacknet.onclick = () => { recordButtonPress("vn_toggle_autohacknet","Toggle AutoHacknet"); actionFlags.toggleAutoHacknet = true; };
+    btnFarmExp.onclick = () => { recordButtonPress("vn_farm_exp","Farm Exp"); actionFlags.farmExp = true; };
+    btnMaxMoney.onclick = () => { recordButtonPress("vn_max_money","Max Money Mode"); actionFlags.maxMoneyMode = true; };
 
     btnMin.onclick = () => { guiState.minimized = !guiState.minimized; content.style.display = guiState.minimized ? "none" : "grid"; debugCard.style.display = guiState.minimized ? "none" : "block"; pushLog(`Minimize toggled -> ${guiState.minimized}`); };
     btnClose.onclick = () => { guiDiv.remove(); guiDiv = null; guiState.visible = false; if (typeof globalThis.vipersNestMenu === "function") globalThis.vipersNestMenu(false); };
@@ -591,6 +656,7 @@ export async function main(ns) {
           const el = document.createElement("div");
           const rootInfo = ns.hasRootAccess(n) ? " ✓" : "";
           el.innerText = `${n}${rootInfo} (${ns.getServerMaxRam(n)||0}GB)`;
+          el.style.textShadow = "0 0 4px #dffaff";
           mapList.appendChild(el);
         }
       } catch(e){}
@@ -599,6 +665,24 @@ export async function main(ns) {
     guiDiv.__canvas = canvas;
     guiDiv.__aiBubble = aiBubble;
     guiDiv.__pushLog = pushLog;
+
+    // Add global animation keyframes
+    const style = document.createElement('style');
+    style.innerHTML = `
+      @keyframes subtlePulse {
+        0% { opacity: 0.9; }
+        100% { opacity: 1; }
+      }
+      @keyframes corePulse {
+        0% { transform: scale(1); box-shadow: 0 0 10px rgba(47,234,255,0.5); }
+        100% { transform: scale(1.05); box-shadow: 0 0 20px rgba(47,234,255,0.8); }
+      }
+      @keyframes corePulseRed {
+        0% { transform: scale(1); box-shadow: 0 0 10px rgba(255,0,0,0.5); }
+        100% { transform: scale(1.05); box-shadow: 0 0 20px rgba(255,0,0,0.8); }
+      }
+    `;
+    document.head.appendChild(style);
   } // createGUI end
 
   // create GUI initially
@@ -813,6 +897,33 @@ export async function main(ns) {
         ns.tprint(JSON.stringify({metrics, toggles, cfg}, null, 2));
         if (guiDiv) guiDiv.__pushLog("Processed: Debug Dump (tprint)");
       }
+      if (actionFlags.toggleAutoPurchase) {
+        actionFlags.toggleAutoPurchase = false;
+        toggles.autoPurchase = !toggles.autoPurchase;
+        if (guiDiv) guiDiv.__pushLog(`AutoPurchase toggled: ${toggles.autoPurchase}`);
+      }
+      if (actionFlags.toggleAutoRoot) {
+        actionFlags.toggleAutoRoot = false;
+        toggles.autoRoot = !toggles.autoRoot;
+        if (guiDiv) guiDiv.__pushLog(`AutoRoot toggled: ${toggles.autoRoot}`);
+      }
+      if (actionFlags.toggleAutoHacknet) {
+        actionFlags.toggleAutoHacknet = false;
+        toggles.autoHacknet = !toggles.autoHacknet;
+        if (guiDiv) guiDiv.__pushLog(`AutoHacknet toggled: ${toggles.autoHacknet}`);
+      }
+      if (actionFlags.farmExp) {
+        actionFlags.farmExp = false;
+        await farmExpMode(pickEasyTargets(all), workers);
+        audioPing();
+        if (guiDiv) guiDiv.__pushLog("Processed: Farm Exp");
+      }
+      if (actionFlags.maxMoneyMode) {
+        actionFlags.maxMoneyMode = false;
+        await maxMoneyMode(pickTargets(all, cfg.targetCount), workers);
+        audioPing();
+        if (guiDiv) guiDiv.__pushLog("Processed: Max Money Mode");
+      }
 
       // auto ops
       await autoRootAll(all);
@@ -909,7 +1020,7 @@ export async function main(ns) {
           // update map
           guiDiv.__updateMap(pickWorkerHosts(all));
 
-          // canvas draw
+          // canvas draw with glow lines
           const c = guiDiv.__canvas;
           const ctx = c.getContext("2d");
           ctx.clearRect(0,0,c.width,c.height);
@@ -927,22 +1038,23 @@ export async function main(ns) {
               if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
             }
             ctx.strokeStyle = "#66eeff";
+            ctx.shadowColor = "#66eeff";
+            ctx.shadowBlur = 10;
             ctx.lineWidth = 2;
             ctx.stroke();
           }
-          // purchased ram bar
+          // purchased ram bar with glow
           const ramPercent = Math.min(1, metrics.totalPurchasedRam / Math.max(1, cfg.purchasedTargetUpgradeMultiplier*512));
           ctx.fillStyle = "rgba(100,200,255,0.12)";
           ctx.fillRect(0,c.height-8,c.width*ramPercent,6);
+          ctx.shadowColor = "#66ffcc";
+          ctx.shadowBlur = 5;
           ctx.fillStyle = "#66ffcc";
           ctx.fillRect(0,c.height-8,c.width*ramPercent,2);
 
-          // AI bubble pulse
-          const totalRamAll = metrics.totalPurchasedRam + (ns.getServerMaxRam("home")||0) + (pickWorkerHosts(all).reduce((a,s)=>a + (ns.getServerMaxRam(s)||0),0) || 0);
-          const freeRamAll = totalFreeRam(pickWorkerHosts(all));
-          const freePct = Math.min(1, totalRamAll === 0 ? 0 : freeRamAll / Math.max(1, totalRamAll));
-          const scale = 0.9 + (freePct * 0.4);
-          guiDiv.__aiBubble.style.transform = `scale(${scale})`;
+          // AI bubble pulse color based on running
+          guiDiv.__aiBubble.style.animation = running ? "corePulse 1.5s infinite alternate" : "corePulseRed 1.5s infinite alternate";
+          guiDiv.__aiBubble.style.background = running ? "radial-gradient(circle at 30% 30%, #2feaff, #005b8a)" : "radial-gradient(circle at 30% 30%, #ff0000, #8a0000)";
 
           // trend indicator
           const trend = computeTrend();
