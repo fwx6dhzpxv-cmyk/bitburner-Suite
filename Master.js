@@ -32,7 +32,7 @@ export async function main(ns) {
     helperFiles: ["hack.js", "grow.js", "weaken.js", "batcher.js"],
     trendSamples: 12,
     trendThresholdPct: 0.03,
-    // Hacknet причины configuration
+    // Hacknet configuration
     hacknetBudgetFraction: 0.12,
     hacknetUpgradePriority: ["level","ram","cores"]
   };
@@ -218,7 +218,7 @@ export async function main(ns) {
           if (host) {
             await deployScriptsTo(host);
             workers.push(host);
-            if (guiDiv) guiDiv.__pushLog(`Purchased ${host} (${targetRam}GB)`);
+            if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Purchased ${host} (${targetRam}GB)`);
           }
         } catch(e){ ns.print(`purchase failed: ${e}`); }
         return;
@@ -239,7 +239,7 @@ export async function main(ns) {
           await deployScriptsTo(host);
           const idx = workers.indexOf(weakest); if (idx>=0) workers.splice(idx,1);
           workers.push(host);
-          if (guiDiv) guiDiv.__pushLog(`Replaced ${weakest} with ${host} (${targetRam}GB)`);
+          if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Replaced ${weakest} with ${host} (${targetRam}GB)`);
         }
       } catch(e){ ns.print(`replace error: ${e}`); metrics.errors.push(""+e); }
     } catch(e) { ns.print("autoManagePurchasedServers error: " + e); metrics.errors.push(""+e); }
@@ -259,7 +259,7 @@ export async function main(ns) {
         const purchaseCost = ns.hacknet.getPurchaseNodeCost();
         if (ns.hacknet.numNodes() < ns.hacknet.maxNumNodes && purchaseCost > 0 && money - purchaseCost > reserve) {
           const idx = ns.hacknet.purchaseNode();
-          if (idx !== -1 && guiDiv) guiDiv.__pushLog(`Hacknet: purchased node #${idx} cost $${Math.floor(purchaseCost)}`);
+          if (idx !== -1 && guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Hacknet: purchased node #${idx} cost $${Math.floor(purchaseCost)}`);
           // be conservative: do one purchase per loop
           return;
         }
@@ -310,7 +310,7 @@ export async function main(ns) {
             else if (u.type === "cores") ok = ns.hacknet.upgradeCore(u.node, 1);
           } catch(e){}
           if (ok) {
-            if (guiDiv) guiDiv.__pushLog(`Hacknet: upgraded node ${u.node} ${u.type} (+1) cost $${Math.floor(u.cost)}`);
+            if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Hacknet: upgraded node ${u.node} ${u.type} (+1) cost $${Math.floor(u.cost)}`);
             // only do one upgrade per main-loop iteration (conservative)
             return;
           }
@@ -341,7 +341,7 @@ export async function main(ns) {
           if (typeof ns.purchaseProgram === "function") {
             if (ns.getServerMoneyAvailable("home") - reserve > 1e6) {
               await ns.purchaseProgram(p);
-              if (guiDiv) guiDiv.__pushLog(`autoBuy: purchased ${p}`);
+              if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`autoBuy: purchased ${p}`);
             }
           }
         } catch(e){ ns.print(`autoBuy err ${p}: ${e}`); metrics.errors.push(""+e); }
@@ -362,10 +362,10 @@ export async function main(ns) {
         const money = ns.getServerMoneyAvailable("home");
         const corpCostSafe = 150e6;
         if (money < corpCostSafe * 1.5) {
-          if (guiDiv) guiDiv.__pushLog(`AutoCorp: not enough cash ($${Math.floor(money)}) to safely create corp.`, "warn");
+          if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoCorp: not enough cash ($${Math.floor(money)}) to safely create corp.`, "warn");
           return;
         }
-        try { ns.corporation.createCorporation("StableCorp", false); if (guiDiv) guiDiv.__pushLog("AutoCorp: created corporation 'StableCorp'."); } catch(e){ ns.print(`AutoCorp create failed: ${e}`); metrics.errors.push(""+e); return; }
+        try { ns.corporation.createCorporation("StableCorp", false); if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("AutoCorp: created corporation 'StableCorp'."); } catch(e){ ns.print(`AutoCorp create failed: ${e}`); metrics.errors.push(""+e); return; }
       }
 
       try {
@@ -375,7 +375,7 @@ export async function main(ns) {
           const corp = ns.corporation.getCorporation();
           if (!corp.divisions || !corp.divisions.some(d=>d.name===divName)) {
             ns.corporation.expandIndustry(industry, divName);
-            if (guiDiv) guiDiv.__pushLog(`AutoCorp: expanded industry ${industry} as ${divName}.`);
+            if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoCorp: expanded industry ${industry} as ${divName}.`);
           }
         } catch(e) {
           try {
@@ -383,7 +383,7 @@ export async function main(ns) {
             if (industries && industries.length) {
               const fallback = industries[0];
               ns.corporation.expandIndustry(fallback, divName);
-              if (guiDiv) guiDiv.__pushLog(`AutoCorp: expanded industry ${fallback} as ${divName} (fallback).`);
+              if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoCorp: expanded industry ${fallback} as ${divName} (fallback).`);
             }
           } catch(err) { ns.print(`AutoCorp expandIndustry failed: ${err}`); metrics.errors.push(""+err); }
         }
@@ -393,7 +393,7 @@ export async function main(ns) {
           if (div && !div.cities.includes(city)) {
             ns.corporation.expandCity(divName, city);
             try { ns.corporation.purchaseOffice(divName, city, 3); } catch(e){}
-            if (guiDiv) guiDiv.__pushLog(`AutoCorp: opened ${divName} office in ${city}.`);
+            if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoCorp: opened ${divName} office in ${city}.`);
           }
         } catch(e) {}
         try {
@@ -419,7 +419,7 @@ export async function main(ns) {
           ns.exec("weaken.js", workers[0], threads, t);
           await safeSleep(100);
           ns.exec("hack.js", workers[0], Math.floor(threads/10), t);
-          if (guiDiv) guiDiv.__pushLog(`Farming exp on ${t} with ${threads} threads`);
+          if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Farming exp on ${t} with ${threads} threads`);
         }
       }
     } catch(e) { metrics.errors.push(""+e); }
@@ -435,14 +435,14 @@ export async function main(ns) {
     }
     try { ns.share(); } catch(e){}
     cfg.baseHackFraction = oldFrac;
-    if (guiDiv) guiDiv.__pushLog("Max Money Mode activated - high hack + share");
+    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Max Money Mode activated - high hack + share");
   }
 
   // ---------------- GUI Implementation ----------------
   let guiDiv = null;
   function createGUI(force=false) {
     if (guiDiv && !force) return;
-    if (guiDiv && force) try { guiDiv.remove(); } catch(e){}
+    if (guiDiv && force) try { guiDiv.remove(); guiDiv = null; } catch(e){}
 
     // root div with sci-fi glow
     guiDiv = document.createElement("div");
@@ -462,12 +462,12 @@ export async function main(ns) {
     const title = document.createElement("div"); title.innerText = "Viper's Nest — Master (trend + debug)"; Object.assign(title.style, {fontWeight:"900", fontSize:"15px", color:"#6fffd1", textShadow:"0 0 6px #66ffff, 0 0 12px #66ffff"});
     header.appendChild(title);
     const spacer = document.createElement("div"); spacer.style.flex = "1"; header.appendChild(spacer);
-    const pauseInfo = document.createElement("div"); pauseInfo.innerText = "⚠ PAUSE REQUIRED before Kill/Restart"; Object.assign(pauseInfo.style, {fontSize:"11px", color:"#ffdca3", fontWeight:"700", marginRight:"8px", textShadow:"0 0 4px #ffdca3"});
+    const pauseInfo = document.createElement("div"); pauseInfo.innerText = "PAUSE REQUIRED before Kill/Restart"; Object.assign(pauseInfo.style, {fontSize:"11px", color:"#ffdca3", fontWeight:"700", marginRight:"8px", textShadow:"0 0 4px #ffdca3"});
     header.appendChild(pauseInfo);
 
-    const btnMin = document.createElement("button"); btnMin.innerText = "▢"; btnMin.title = "Minimize"; Object.assign(btnMin.style, {background:"transparent",border:"none",color:"#88dfff",cursor:"pointer",fontSize:"14px",fontWeight:"700", textShadow:"0 0 4px #88dfff"});
+    const btnMin = document.createElement("button"); btnMin.innerText = "Minimize"; btnMin.title = "Minimize"; Object.assign(btnMin.style, {background:"transparent",border:"none",color:"#88dfff",cursor:"pointer",fontSize:"14px",fontWeight:"700", textShadow:"0 0 4px #88dfff"});
     header.appendChild(btnMin);
-    const btnClose = document.createElement("button"); btnClose.innerText = "✕"; btnClose.title = "Close (vipersNestMenu() to reopen)"; Object.assign(btnClose.style, {background:"transparent",border:"none",color:"#ff9b9b",cursor:"pointer",fontSize:"14px",fontWeight:"700", textShadow:"0 0 4px #ff9b9b"});
+    const btnClose = document.createElement("button"); btnClose.innerText = "Close"; btnClose.title = "Close (vipersNestMenu() to reopen)"; Object.assign(btnClose.style, {background:"transparent",border:"none",color:"#ff9b9b",cursor:"pointer",fontSize:"14px",fontWeight:"700", textShadow:"0 0 4px #ff9b9b"});
     header.appendChild(btnClose);
 
     guiDiv.appendChild(header);
@@ -521,7 +521,7 @@ export async function main(ns) {
 
     // controls area
     const controls = document.createElement("div"); Object.assign(controls.style,{display:"flex",flexWrap:"wrap",gap:"6px"});
-    function mkBtn(label, tooltip, id, color) {
+    function mkBtn(label, tooltip, id) {
       const b = document.createElement("button");
       b.innerText = label;
       b.title = tooltip;
@@ -530,36 +530,45 @@ export async function main(ns) {
         padding: "8px 10px",
         borderRadius: "8px",
         border: "1px solid rgba(0,255,255,0.3)",
-        background: color || "linear-gradient(180deg, #3a3f5a, #1b1d2a)",
-        color: "#ffffff",
+        background: "linear-gradient(180deg, rgba(40,50,70,0.8), rgba(20,30,50,0.8))",
+        color: "#0ff",
         fontWeight: "800",
+        fontSize: "11px",
         cursor: "pointer",
-        transition: "transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease",
-        boxShadow: "0 0 10px rgba(0,255,255,0.4)",
-        animation: "subtlePulse 2s infinite"
+        transition: "all 0.2s ease",
+        boxShadow: "0 0 8px rgba(0,255,255,0.4)",
+        textShadow: "0 0 4px rgba(0,255,255,0.6)"
       });
-      b.onmouseenter = () => { b.style.transform = "scale(1.05)"; b.style.boxShadow = "0 0 20px rgba(0,255,255,0.8)"; };
-      b.onmouseleave = () => { b.style.transform = "scale(1)"; b.style.boxShadow = "0 0 10px rgba(0,255,255,0.4)"; };
+      b.onmouseenter = () => { 
+        b.style.background = "linear-gradient(180deg, rgba(60,80,120,0.9), rgba(40,60,100,0.9))";
+        b.style.boxShadow = "0 0 16px rgba(0,255,255,0.8)";
+        b.style.transform = "translateY(-1px)";
+      };
+      b.onmouseleave = () => { 
+        b.style.background = "linear-gradient(180deg, rgba(40,50,70,0.8), rgba(20,30,50,0.8))";
+        b.style.boxShadow = "0 0 8px rgba(0,255,255,0.4)";
+        b.style.transform = "translateY(0)";
+      };
       return b;
     }
 
-    const btnStart = mkBtn("Start","Start automations","vn_start","linear-gradient(180deg,#9eff9e,#66ff66)");
-    const btnPause = mkBtn("Pause","Pause automations","vn_pause","linear-gradient(180deg,#ffdca3,#ffb36b)");
-    const btnDeploy = mkBtn("Deploy Now","Deploy helper scripts to all workers now","vn_deploy","linear-gradient(180deg,#6fffd1,#2feaff)");
-    const btnUpgrade = mkBtn("Upgrade Now","Attempt immediate purchased-server upgrade","vn_upgrade","linear-gradient(180deg,#ff6fcf,#ff88ff)");
-    const btnKill = mkBtn("Kill Helpers","Kill helper scripts on purchased servers (PAUSE first)","vn_kill","linear-gradient(180deg,#ff9b9b,#ff6b6b)");
-    const btnKillTree = mkBtn("Kill-Tree","Kill helpers across network (PAUSE first)","vn_killtree","linear-gradient(180deg,#ff9b9b,#ff6b6b)");
-    const btnStartWorkers = mkBtn("Start Workers","Start integrated worker manager (launch batchers)","vn_startworkers","linear-gradient(180deg,#6f9fff,#4f6fff)");
-    const btnStopWorkers = mkBtn("Stop Workers","Stop integrated worker manager (kill batchers)","vn_stopworkers","linear-gradient(180deg,#ffdca3,#ffb36b)");
-    const btnBoostHack = mkBtn("Boost Hack","Temporary aggressive hack mode","vn_boost_hack","linear-gradient(180deg,#fffc6f,#ffea6f)");
-    const btnBoostGrow = mkBtn("Boost Grow","Temporary aggressive grow mode","vn_boost_grow","linear-gradient(180deg,#6fffd1,#2feaff)");
-    const btnBoostWeaken = mkBtn("Boost Weaken","Temporary heavy weaken mode","vn_boost_weaken","linear-gradient(180deg,#9eff9e,#66ff66)");
-    const btnDebugDump = mkBtn("Debug Dump","Dump debug info to log","vn_debugdump","linear-gradient(180deg,#d0d0ff,#a0a0ff)");
-    const btnToggleAutoPurchase = mkBtn("Toggle AutoPurchase","Toggle auto server purchase","vn_toggle_autopurchase","linear-gradient(180deg,#ff6fcf,#ff88ff)");
-    const btnToggleAutoRoot = mkBtn("Toggle AutoRoot","Toggle auto rooting","vn_toggle_autoroot","linear-gradient(180deg,#6f9fff,#4f6fff)");
-    const btnToggleAutoHacknet = mkBtn("Toggle AutoHacknet","Toggle auto hacknet upgrades","vn_toggle_autohacknet","linear-gradient(180deg,#9eff9e,#66ff66)");
-    const btnFarmExp = mkBtn("Farm Exp","Farm hacking exp on easy targets","vn_farm_exp","linear-gradient(180deg,#fffc6f,#ffea6f)");
-    const btnMaxMoney = mkBtn("Max Money Mode","Aggressive money farming","vn_max_money","linear-gradient(180deg,#ff6fcf,#ff88ff)");
+    const btnStart = mkBtn("Start","Start automations","vn_start");
+    const btnPause = mkBtn("Pause","Pause automations","vn_pause");
+    const btnDeploy = mkBtn("Deploy Now","Deploy helper scripts to all workers now","vn_deploy");
+    const btnUpgrade = mkBtn("Upgrade Now","Attempt immediate purchased-server upgrade","vn_upgrade");
+    const btnKill = mkBtn("Kill Helpers","Kill helper scripts on purchased servers (PAUSE first)","vn_kill");
+    const btnKillTree = mkBtn("Kill-Tree","Kill helpers across network (PAUSE first)","vn_killtree");
+    const btnStartWorkers = mkBtn("Start Workers","Start integrated worker manager (launch batchers)","vn_startworkers");
+    const btnStopWorkers = mkBtn("Stop Workers","Stop integrated worker manager (kill batchers)","vn_stopworkers");
+    const btnBoostHack = mkBtn("Boost Hack","Temporary aggressive hack mode","vn_boost_hack");
+    const btnBoostGrow = mkBtn("Boost Grow","Temporary aggressive grow mode","vn_boost_grow");
+    const btnBoostWeaken = mkBtn("Boost Weaken","Temporary heavy weaken mode","vn_boost_weaken");
+    const btnDebugDump = mkBtn("Debug Dump","Dump debug info to log","vn_debugdump");
+    const btnToggleAutoPurchase = mkBtn("AutoPurchase","Toggle auto server purchase","vn_toggle_autopurchase");
+    const btnToggleAutoRoot = mkBtn("AutoRoot","Toggle auto rooting","vn_toggle_autoroot");
+    const btnToggleAutoHacknet = mkBtn("AutoHacknet","Toggle auto hacknet upgrades","vn_toggle_autohacknet");
+    const btnFarmExp = mkBtn("Farm Exp","Farm hacking exp on easy targets","vn_farm_exp");
+    const btnMaxMoney = mkBtn("Max Money","Aggressive money farming","vn_max_money");
 
     [btnStart,btnPause,btnDeploy,btnUpgrade,btnKill,btnKillTree,btnStartWorkers,btnStopWorkers,btnBoostHack,btnBoostGrow,btnBoostWeaken,btnDebugDump,btnToggleAutoPurchase,btnToggleAutoRoot,btnToggleAutoHacknet,btnFarmExp,btnMaxMoney].forEach(b=>controls.appendChild(b));
     right.appendChild(controls);
@@ -649,7 +658,7 @@ export async function main(ns) {
         mapList.innerHTML = "";
         for (const n of nodes) {
           const el = document.createElement("div");
-          const rootInfo = ns.hasRootAccess(n) ? " ✓" : "";
+          const rootInfo = ns.hasRootAccess(n) ? " Check" : "";
           el.innerText = `${n}${rootInfo} (${ns.getServerMaxRam(n)||0}GB)`;
           el.style.textShadow = "0 0 4px #dffaff";
           mapList.appendChild(el);
@@ -688,34 +697,34 @@ export async function main(ns) {
     for (const w of workers) {
       try { await deployScriptsTo(w); } catch ( e ) { ns.print("deploy err: " + e); }
     }
-    if (guiDiv) guiDiv.__pushLog("Deployed helper scripts to workers.");
+    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Deployed helper scripts to workers.");
   }
 
   async function doUpgradeNow(workers) {
     await autoManagePurchasedServers(workers);
-    if (guiDiv) guiDiv.__pushLog("Auto-upgrade attempted.");
+    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Auto-upgrade attempted.");
   }
 
   function doKillHelpers(workers) {
     if (running) {
-      if (guiDiv) guiDiv.__pushLog("Kill request blocked: Please PAUSE automation before killing helpers.", "warn");
+      if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Kill request blocked: Please PAUSE automation before killing helpers.", "warn");
       return;
     }
     for (const w of workers) {
       try { ns.killall(w); } catch ( e ) {}
     }
-    if (guiDiv) guiDiv.__pushLog("Kill all helpers executed.");
+    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Kill all helpers executed.");
   }
 
   async function doKillTree(allServers) {
     if (running) {
-      if (guiDiv) guiDiv.__pushLog("Kill-tree blocked: Please PAUSE automation before kill-tree.", "warn");
+      if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Kill-tree blocked: Please PAUSE automation before kill-tree.", "warn");
       return;
     }
     for (const s of allServers) {
       try { ns.killall(s); } catch ( e ) {}
     }
-    if (guiDiv) guiDiv.__pushLog("Kill-tree executed across network.");
+    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Kill-tree executed across network.");
   }
 
   async function startIntegratedWorkers(targets, workers) {
@@ -739,7 +748,7 @@ export async function main(ns) {
           iter++;
         }
         if (requiredRam > freeRam) {
-          if (guiDiv) guiDiv.__pushLog(`WorkerManager skipping ${t}: need ${requiredRam.toFixed(2)}GB free ${freeRam.toFixed(2)}GB`);
+          if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`WorkerManager skipping ${t}: need ${requiredRam.toFixed(2)}GB free ${freeRam.toFixed(2)}GB`);
           continue;
         }
         const args = [t, desiredFrac, JSON.stringify(currentWorkers)];
@@ -747,9 +756,9 @@ export async function main(ns) {
         if (pid === 0) {
           let best="home"; let bestRam = ns.getServerMaxRam("home");
           for (const w of currentWorkers) { try { const r = ns.getServerMaxRam(w); if (r > bestRam) { best = w; bestRam = r; } } catch(e){} }
-          try { await ns.scp(["batcher.js"], best); pid = ns.exec("batcher.js", best, 1, ...args); if (pid !==0 && guiDiv) guiDiv.__pushLog(`WorkerManager started ${t} on ${best} pid ${pid}`); } catch(e){ ns.print("worker start fallback err: " + e); metrics.errors.push(""+e); }
+          try { await ns.scp(["batcher.js"], best); pid = ns.exec("batcher.js", best, 1, ...args); if (pid !==0 && guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`WorkerManager started ${t} on ${best} pid ${pid}`); } catch(e){ ns.print("worker start fallback err: " + e); metrics.errors.push(""+e); }
         } else {
-          if (guiDiv) guiDiv.__pushLog(`WorkerManager launched batcher for ${t} pid ${pid}`);
+          if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`WorkerManager launched batcher for ${t} pid ${pid}`);
         }
         metrics.batchesLaunched++;
         await safeSleep(80);
@@ -761,7 +770,7 @@ export async function main(ns) {
     for (const w of workers) {
       try { ns.killall(w); } catch(e) {}
     }
-    if (guiDiv) guiDiv.__pushLog("WorkerManager stop: killall executed on workers.");
+    if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("WorkerManager stop: killall executed on workers.");
   }
 
   // ---------------- audio ping ----------------
@@ -795,9 +804,9 @@ export async function main(ns) {
     const last = samples[samples.length-1].m;
     const slope = first > 0 ? (last-first)/first : 0;
     const pct = slope;
-    if (pct > cfg.trendThresholdPct) return { label: "BULLISH ▲", slope: pct };
-    if (pct < -cfg.trendThresholdPct) return { label: "BEARISH ▼", slope: pct };
-    return { label: "NEUTRAL ■", slope: pct };
+    if (pct > cfg.trendThresholdPct) return { label: "BULLISH Up Arrow", slope: pct };
+    if (pct < -cfg.trendThresholdPct) return { label: "BEARISH Down Arrow", slope: pct };
+    return { label: "NEUTRAL Square", slope: pct };
   }
 
   // ---------------- main loop ----------------
@@ -810,7 +819,7 @@ export async function main(ns) {
 
       // handle GUI recorded button press logging (DOM side already logged; this just echoes)
       if (lastButtonPressed.id) {
-        if (guiDiv) guiDiv.__pushLog(`Button recorded: ${lastButtonPressed.label} @ ${new Date(lastButtonPressed.time).toLocaleTimeString()}`);
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Button recorded: ${lastButtonPressed.label} @ ${new Date(lastButtonPressed.time).toLocaleTimeString()}`);
         lastButtonPressed.id = null;
       }
 
@@ -819,7 +828,7 @@ export async function main(ns) {
         actionFlags.rebuildWorkers = false;
         workers = pickWorkerHosts(all);
         for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
-        if (guiDiv) guiDiv.__pushLog("Workers rebuilt (flag processed).");
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Workers rebuilt (flag processed).");
       }
 
       // process GUI-triggered flags (only here we call ns.*)
@@ -829,7 +838,7 @@ export async function main(ns) {
         for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
         await doDeployNow(workers);
         audioPing();
-        if (guiDiv) guiDiv.__pushLog("Processed: Deploy Now");
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Deploy Now");
       }
       if (actionFlags.upgradeNow) {
         actionFlags.upgradeNow = false;
@@ -837,7 +846,7 @@ export async function main(ns) {
         for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
         await doUpgradeNow(workers);
         audioPing();
-        if (guiDiv) guiDiv.__pushLog("Processed: Upgrade Now");
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Upgrade Now");
       }
       if (actionFlags.killAllHelpers) {
         actionFlags.killAllHelpers = false;
@@ -845,13 +854,13 @@ export async function main(ns) {
         for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
         doKillHelpers(workers);
         audioPing();
-        if (guiDiv) guiDiv.__pushLog("Processed: Kill Helpers");
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Kill Helpers");
       }
       if (actionFlags.killTree) {
         actionFlags.killTree = false;
         await doKillTree(all);
         audioPing();
-        if (guiDiv) guiDiv.__pushLog("Processed: Kill-Tree");
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Kill-Tree");
       }
       if (actionFlags.startWorkers) {
         actionFlags.startWorkers = false;
@@ -859,7 +868,7 @@ export async function main(ns) {
         for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
         await startIntegratedWorkers(pickTargets(all, cfg.targetCount), workers);
         audioPing();
-        if (guiDiv) guiDiv.__pushLog("Processed: Start Workers");
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Start Workers");
       }
       if (actionFlags.stopWorkers) {
         actionFlags.stopWorkers = false;
@@ -867,11 +876,11 @@ export async function main(ns) {
         for (const p of ns.getPurchasedServers()) if (!workers.includes(p)) workers.push(p);
         await stopIntegratedWorkers(workers);
         audioPing();
-        if (guiDiv) guiDiv.__pushLog("Processed: Stop Workers");
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Stop Workers");
       }
       if (actionFlags.boostMode) {
         const mode = actionFlags.boostMode; actionFlags.boostMode = null;
-        if (guiDiv) guiDiv.__pushLog(`Processing boostMode: ${mode}`);
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Processing boostMode: ${mode}`);
         if (mode === "hack") {
           const old = cfg.baseHackFraction;
           cfg.baseHackFraction = Math.min(0.05, old * 6);
@@ -885,39 +894,39 @@ export async function main(ns) {
           cfg.baseHackFraction = old;
         }
         audioPing();
-        if (guiDiv) guiDiv.__pushLog(`Processed: Boost ${mode}`);
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Processed: Boost ${mode}`);
       }
       if (actionFlags.debugDump) {
         actionFlags.debugDump = false;
         ns.tprint(JSON.stringify({metrics, toggles, cfg}, null, 2));
-        if (guiDiv) guiDiv.__pushLog("Processed: Debug Dump (tprint)");
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Debug Dump (tprint)");
       }
       if (actionFlags.toggleAutoPurchase) {
         actionFlags.toggleAutoPurchase = false;
         toggles.autoPurchase = !toggles.autoPurchase;
-        if (guiDiv) guiDiv.__pushLog(`AutoPurchase toggled: ${toggles.autoPurchase}`);
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoPurchase toggled: ${toggles.autoPurchase}`);
       }
       if (actionFlags.toggleAutoRoot) {
         actionFlags.toggleAutoRoot = false;
         toggles.autoRoot = !toggles.autoRoot;
-        if (guiDiv) guiDiv.__pushLog(`AutoRoot toggled: ${toggles.autoRoot}`);
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoRoot toggled: ${toggles.autoRoot}`);
       }
       if (actionFlags.toggleAutoHacknet) {
         actionFlags.toggleAutoHacknet = false;
         toggles.autoHacknet = !toggles.autoHacknet;
-        if (guiDiv) guiDiv.__pushLog(`AutoHacknet toggled: ${toggles.autoHacknet}`);
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`AutoHacknet toggled: ${toggles.autoHacknet}`);
       }
       if (actionFlags.farmExp) {
         actionFlags.farmExp = false;
         await farmExpMode(pickEasyTargets(all), workers);
         audioPing();
-        if (guiDiv) guiDiv.__pushLog("Processed: Farm Exp");
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Farm Exp");
       }
       if (actionFlags.maxMoneyMode) {
         actionFlags.maxMoneyMode = false;
         await maxMoneyMode(pickTargets(all, cfg.targetCount), workers);
         audioPing();
-        if (guiDiv) guiDiv.__pushLog("Processed: Max Money Mode");
+        if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog("Processed: Max Money Mode");
       }
 
       // auto ops
@@ -984,7 +993,7 @@ export async function main(ns) {
               iter++;
             }
             if (requiredRam > freeRam) {
-              if (guiDiv) guiDiv.__pushLog(`Skipping ${t}: requires ${requiredRam.toFixed(2)}GB, free ${freeRam.toFixed(2)}GB`);
+              if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Skipping ${t}: requires ${requiredRam.toFixed(2)}GB, free ${freeRam.toFixed(2)}GB`);
               continue;
             }
             const args = [t, desiredFrac, JSON.stringify(currentWorkers)];
@@ -992,10 +1001,10 @@ export async function main(ns) {
             if (pid === 0) {
               let best="home"; let bestRam = ns.getServerMaxRam("home");
               for (const w of currentWorkers) { try { const r = ns.getServerMaxRam(w); if (r > bestRam) { best = w; bestRam = r; } } catch(e){} }
-              try { await ns.scp(["batcher.js"], best); pid = ns.exec("batcher.js", best, 1, ...args); if (pid!==0) { metrics.batchesLaunched++; if (guiDiv) guiDiv.__pushLog(`Fallback started ${t} on ${best} (pid ${pid})`); } else { if (guiDiv) guiDiv.__pushLog(`Failed start ${t}`); } } catch(e){ ns.print(`Fallback failed ${t}: ${e}`); metrics.errors.push(""+e); }
+              try { await ns.scp(["batcher.js"], best); pid = ns.exec("batcher.js", best, 1, ...args); if (pid!==0) { metrics.batchesLaunched++; if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Fallback started ${t} on ${best} (pid ${pid})`); } else { if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Failed start ${t}`); } } catch(e){ ns.print(`Fallback failed ${t}: ${e}`); metrics.errors.push(""+e); }
             } else {
               metrics.batchesLaunched++;
-              if (guiDiv) guiDiv.__pushLog(`Launched batcher for ${t} (hackFrac ${(desiredFrac*100).toFixed(3)}%) pid ${pid}`);
+              if (guiDiv && guiDiv.__pushLog) guiDiv.__pushLog(`Launched batcher for ${t} (hackFrac ${(desiredFrac*100).toFixed(3)}%) pid ${pid}`);
             }
             metrics.lastPlans[t] = { plan, requiredRam, freeRam, desiredFrac };
           } catch(e){ ns.print(`schedule err ${t}: ${e}`); metrics.errors.push(""+e); }
@@ -1005,7 +1014,7 @@ export async function main(ns) {
 
       // GUI updates (DOM-only)
       try {
-        if (guiDiv) {
+        if (guiDiv && guiDiv.__refs) {
           const refs = guiDiv.__refs;
           refs.statMoney.value.innerText = `$${Math.floor(metrics.moneyHistory.length?metrics.moneyHistory[metrics.moneyHistory.length-1].m:ns.getServerMoneyAvailable("home")).toLocaleString()}`;
           refs.statMoneySec.value.innerText = `$${metrics.moneyPerSec.toFixed(2)}/s`;
@@ -1055,8 +1064,8 @@ export async function main(ns) {
           const trend = computeTrend();
           try {
             guiDiv.__refs.trendBadge.innerText = `TREND: ${trend.label}`;
-            if (trend.label.indexOf("BULL")>=0) guiDiv.__refs.trendBadge.style.color = "#9eff9e";
-            else if (trend.label.indexOf("BEAR")>=0) guiDiv.__refs.trendBadge.style.color = "#ff9b9b";
+            if (trend.label.includes("BULL")) guiDiv.__refs.trendBadge.style.color = "#9eff9e";
+            else if (trend.label.includes("BEAR")) guiDiv.__refs.trendBadge.style.color = "#ff9b9b";
             else guiDiv.__refs.trendBadge.style.color = "#ffdca3";
           } catch(e){}
 
