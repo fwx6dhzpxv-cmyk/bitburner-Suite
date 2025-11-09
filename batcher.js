@@ -14,7 +14,7 @@ export async function main(ns) {
     ns.disableLog("sleep");
 
     const target = ns.args[0];
-    const frac   = ns.args[1];
+    let frac = ns.args[1];
     const workers = JSON.parse(ns.args[2]);
 
     const ramH = ns.getScriptRam("hack.js");
@@ -26,10 +26,10 @@ export async function main(ns) {
     const SEC_GROW = 0.004;
     const SEC_WEAK = 0.05;
 
-    function estimatePlan() {
+    function estimatePlan(myFrac) {
         const maxMoney = ns.getServerMaxMoney(target);
         const currentMoney = Math.max(1, ns.getServerMoneyAvailable(target));
-        const steal = Math.max(1, Math.min(maxMoney * frac, currentMoney));
+        const steal = Math.max(1, Math.min(maxMoney * myFrac, currentMoney));
 
         const hackThreads = Math.max(1, Math.ceil(ns.hackAnalyzeThreads(target, steal)));
 
@@ -53,6 +53,10 @@ export async function main(ns) {
         })).filter(e => e.free > 0);
     }
 
+    function getTotalFreeRam() {
+        return workers.reduce((acc, w) => acc + ns.getServerMaxRam(w) - ns.getServerUsedRam(w), 0);
+    }
+
     async function trySchedule(host, script, threads, ...args) {
         if (threads <= 0) return true;
 
@@ -69,54 +73,125 @@ export async function main(ns) {
     const VERBOSE = false; // set to true if you ever want debug prints
 
     while (true) {
-        const plan = estimatePlan();
+        let myFrac = frac;
+        let plan = estimatePlan(myFrac);
 
-        const jobs = [
-            { script: "weaken.js", threads: plan.weakenThreads1, args: [target] },
-            { script: "hack.js",   threads: plan.hackThreads,     args: [target] },
-            { script: "grow.js",   threads: plan.growThreads,     args: [target] },
-            { script: "weaken.js", threads: plan.weakenThreads2,  args: [target] }
-        ];
-
-        let scheduledAll = true;
-
-        for (const job of jobs) {
-            let remaining = job.threads;
+        // First, schedule as many weaken2 as possible (partial OK)
+        let w2Remaining = plan.weakenThreads2;
+        if (w2Remaining > 0) {
             let freeHosts = getFreeRamList();
-
             for (const h of freeHosts) {
-                if (remaining <= 0) break;
-
-                const scriptRam = ns.getScriptRam(job.script);
+                if (w2Remaining <= 0) break;
+                const scriptRam = ramW;
                 const maxFits = Math.floor(h.free / scriptRam);
                 if (maxFits <= 0) continue;
-
-                const runThreads = Math.min(maxFits, remaining);
-
-                const ok = await trySchedule(h.host, job.script, runThreads, ...job.args);
-                if (!ok) continue;
-
-                remaining -= runThreads;
-            }
-
-            if (remaining > 0) {
-                scheduledAll = false;
-
-                if (VERBOSE) {
-                    ns.print(
-                        `WARN: ${job.script} needed ${job.threads} but ${remaining} could not schedule.`
-                    );
-                }
+                const runThreads = Math.min(maxFits, w2Remaining);
+                const ok = await trySchedule(h.host, "weaken.js", runThreads, target);
+                if (ok) w2Remaining -= runThreads;
             }
         }
 
-        if (!scheduledAll) {
-            // Instead of spamming terminal, sleep quietly and retry later
+        // Now, for the batch, check if full possible; if not, binary search for smaller frac
+        let batchJobs = [
+            { script: "hack.js", threads: plan.hackThreads, args: [target] },
+            { script: "grow.js", threads: plan.growThreads, args: [target] },
+            { script: "weaken.js", threads: plan.weakenThreads1, args: [target] }
+        ];
+
+        // Function to check if jobs can be scheduled (dry run)
+        function canSchedule(jobs) {
+            const simFree = getFreeRamList().map(e => ({ ...e }));
+            for (const job of jobs) {
+                let simRemaining = job.threads;
+                for (const h of simFree) {
+                    if (simRemaining <= 0) break;
+                    const scriptRam = ns.getScriptRam(job.script);
+                    const maxFits = Math.floor(h.free / scriptRam);
+                    if (maxFits <= 0) continue;
+                    const runThreads = Math.min(maxFits, simRemaining);
+                    h.free -= runThreads * scriptRam;
+                    simRemaining -= runThreads;
+                }
+                if (simRemaining > 0) return false;
+            }
+            return true;
+        }
+
+        let scheduled = canSchedule(batchJobs);
+
+        if (!scheduled) {
+            // Binary search for max myFrac
+            let low = 0;
+            let high = myFrac;
+            let bestFrac = 0;
+            let bestPlan = null;
+            for (let i = 0; i < 20; i++) {
+                let mid = (low + high) / 2;
+                let tempPlan = estimatePlan(mid);
+                let tempJobs = [
+                    { script: "hack.js", threads: tempPlan.hackThreads, args: [target] },
+                    { script: "grow.js", threads: tempPlan.growThreads, args: [target] },
+                    { script: "weaken.js", threads: tempPlan.weakenThreads1, args: [target] }
+                ];
+                if (canSchedule(tempJobs) && mid > bestFrac) {
+                    bestFrac = mid;
+                    bestPlan = tempPlan;
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            if (bestFrac > 0 && bestPlan.hackThreads >= 1) {
+                myFrac = bestFrac;
+                plan = bestPlan;
+                batchJobs = [
+                    { script: "hack.js", threads: plan.hackThreads, args: [target] },
+                    { script: "grow.js", threads: plan.growThreads, args: [target] },
+                    { script: "weaken.js", threads: plan.weakenThreads1, args: [target] }
+                ];
+                scheduled = true;
+            }
+        }
+
+        if (!scheduled) {
+            if (VERBOSE && plan.weakenThreads2 === 0) {
+                ns.print(`No room for batch, sleeping.`);
+            }
             await ns.sleep(2000);
             continue;
         }
 
-        // Fully scheduled — sleep until next batch window
-        await ns.sleep(2000);
+        // Schedule the batch
+        let scheduledAll = true;
+        for (const job of batchJobs) {
+            let remaining = job.threads;
+            let freeHosts = getFreeRamList();
+            for (const h of freeHosts) {
+                if (remaining <= 0) break;
+                const scriptRam = ns.getScriptRam(job.script);
+                const maxFits = Math.floor(h.free / scriptRam);
+                if (maxFits <= 0) continue;
+                const runThreads = Math.min(maxFits, remaining);
+                const ok = await trySchedule(h.host, job.script, runThreads, ...job.args);
+                if (!ok) {
+                    scheduledAll = false;
+                    break;
+                }
+                remaining -= runThreads;
+            }
+            if (remaining > 0) {
+                scheduledAll = false;
+                if (VERBOSE) {
+                    ns.print(`WARN: ${job.script} needed ${job.threads} but ${remaining} could not schedule.`);
+                }
+                break;
+            }
+        }
+
+        if (!scheduledAll) {
+            // Should not happen due to dry run
+            await ns.sleep(2000);
+        }
+        // No sleep if successful, loop immediately to try next batch
     }
 }
